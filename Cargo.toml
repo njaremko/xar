@@ -1,0 +1,21 @@
+[package]
+name = "xar-array"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nathan Jaremko <nathan@jaremko.ca>"]
+license = "MIT OR Apache-2.0"
+description = "A segmented exponential array with stable element addresses."
+readme = "README.md"
+keywords = ["array", "vector", "stable", "segmented", "container"]
+categories = ["data-structures", "no-std"]
+
+[lib]
+name = "xar"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dev-dependencies]
+hegeltest = "0.23.2"
