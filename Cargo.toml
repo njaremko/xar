@@ -1,6 +1,6 @@
 [package]
 name = "xar-array"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Nathan Jaremko <nathan@jaremko.ca>"]
 license = "MIT OR Apache-2.0"
