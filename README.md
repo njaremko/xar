@@ -2,9 +2,9 @@
 
 `xar` is a Rust implementation of an exponential segmented array: a `Vec`-like
 appendable collection whose elements live in independently allocated chunks. The
-first chunk has `1 << BASE_SHIFT` slots, the next chunk has twice as many, and so
-on. Existing chunks are never reallocated, so element addresses remain stable
-while those elements remain initialized.
+first two chunks each have `1 << BASE_SHIFT` slots, then each later chunk
+doubles. Existing chunks are never reallocated, so element addresses remain
+stable while those elements remain initialized.
 
 This is useful for append-heavy collections such as AST nodes, IR nodes, graph
 nodes, editor objects, or other object stores where external structures keep raw
@@ -61,7 +61,7 @@ directly:
 ```rust
 use xar::ExponentialArray;
 
-// First chunk: 4 elements. Total chunks: 8.
+// First two chunks: 4 elements each. Total chunks: 8.
 let mut xs = ExponentialArray::<u32, 2, 8>::new();
 ```
 

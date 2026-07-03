@@ -4,11 +4,11 @@
 
 //! A segmented exponential array with stable element addresses.
 //!
-//! `xar` stores elements in chunks whose capacities grow by powers of two:
-//! the first chunk has `1 << BASE_SHIFT` slots, the next has twice that, and
-//! so on. Chunks are allocated independently and are never reallocated, so the
-//! address of an initialized element does not change when later elements are
-//! pushed.
+//! `xar` stores elements in chunks mapped by power-of-two index ranges: the
+//! first two chunks have `1 << BASE_SHIFT` slots each, then each later chunk
+//! doubles. Chunks are allocated independently and are never reallocated, so
+//! the address of an initialized element does not change when later elements
+//! are pushed.
 //!
 //! This is not a drop-in replacement for [`Vec`]. It is intentionally not
 //! contiguous. Use [`chunks`](ExponentialArray::chunks) or
@@ -58,7 +58,7 @@
 //! let xs = (0..10).collect::<ExponentialArray<_, 2, 4>>();
 //! let chunk_lengths = xs.chunks().map(<[i32]>::len).collect::<Vec<_>>();
 //!
-//! assert_eq!(chunk_lengths, vec![4, 6]);
+//! assert_eq!(chunk_lengths, vec![4, 4, 2]);
 //! ```
 
 extern crate alloc;
@@ -80,8 +80,8 @@ extern crate std;
 
 /// The default base-2 exponent for the first chunk.
 ///
-/// With the default value, the first chunk holds 16 elements, the second holds
-/// 32, the third holds 64, and so on.
+/// With the default value, the first two chunks hold 16 elements each, the
+/// third holds 32, the fourth holds 64, and so on.
 pub const DEFAULT_BASE_SHIFT: usize = 4;
 
 /// The default number of chunk pointers stored inline on 64-bit platforms.
@@ -113,9 +113,10 @@ pub type Xar<T> = ExponentialArray<T, DEFAULT_BASE_SHIFT, DEFAULT_CHUNKS>;
 
 /// A segmented exponential array.
 ///
-/// The first chunk capacity is `1 << BASE_SHIFT`. Each later chunk doubles in
-/// capacity. `CHUNKS` is the fixed number of inline chunk pointers in the
-/// container metadata.
+/// Chunk `0` stores indices below `1 << BASE_SHIFT`. Chunk `c > 0` stores the
+/// power-of-two range from `1 << (BASE_SHIFT + c - 1)` up to, but not
+/// including, `1 << (BASE_SHIFT + c)`. `CHUNKS` is the fixed number of inline
+/// chunk pointers in the container metadata.
 ///
 /// # Address stability
 ///
@@ -691,12 +692,23 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
             return None;
         }
 
-        let shift = BASE_SHIFT.checked_add(chunk)?;
+        let shift = Self::chunk_shift(chunk)?;
+        Some(Self::capacity_for_shift(shift))
+    }
+
+    fn chunk_shift(chunk: usize) -> Option<usize> {
+        let growth_shift = if chunk == 0 { 0 } else { chunk - 1 };
+        let shift = BASE_SHIFT.checked_add(growth_shift)?;
         if shift >= usize::BITS as usize {
             return None;
         }
 
-        Some(1usize << shift)
+        Some(shift)
+    }
+
+    fn capacity_for_shift(shift: usize) -> usize {
+        debug_assert!(shift < usize::BITS as usize);
+        1usize << shift
     }
 
     fn chunk_layout(chunk: usize) -> Result<Layout, TryReserveError> {
@@ -705,18 +717,36 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         Layout::array::<MaybeUninit<T>>(capacity).map_err(|_| TryReserveError::capacity_overflow())
     }
 
-    fn chunk_start(chunk: usize) -> usize {
-        debug_assert!(chunk < usize::BITS as usize);
-        debug_assert!(BASE_SHIFT < usize::BITS as usize);
-        ((1usize << chunk) - 1) << BASE_SHIFT
+    fn chunk_start_unchecked(chunk: usize) -> usize {
+        if chunk == 0 {
+            0
+        } else {
+            let shift = BASE_SHIFT + chunk - 1;
+            debug_assert!(shift < usize::BITS as usize);
+            Self::capacity_for_shift(shift)
+        }
+    }
+
+    fn chunk_capacity_unchecked(chunk: usize) -> usize {
+        let shift = BASE_SHIFT + chunk.saturating_sub(1);
+        debug_assert!(shift < usize::BITS as usize);
+        Self::capacity_for_shift(shift)
     }
 
     fn locate(index: usize) -> (usize, usize) {
         debug_assert!(BASE_SHIFT < usize::BITS as usize);
 
-        let bucket = (index >> BASE_SHIFT) + 1;
-        let chunk = (usize::BITS as usize - 1) - bucket.leading_zeros() as usize;
-        let start = Self::chunk_start(chunk);
+        let scaled_index = index >> BASE_SHIFT;
+        if scaled_index == 0 {
+            return (0, index);
+        }
+
+        let chunk = usize::BITS as usize - scaled_index.leading_zeros() as usize;
+        debug_assert!(chunk < CHUNKS);
+        let start = Self::chunk_start_unchecked(chunk);
+        let capacity = Self::chunk_capacity_unchecked(chunk);
+        debug_assert!(index >= start);
+        debug_assert!(index - start < capacity);
 
         (chunk, index - start)
     }
@@ -761,11 +791,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
 
         // SAFETY: callers only request initialized/reserved indices, and all
         // chunks up to that index have been allocated.
-        let base = unsafe {
-            (*array).chunks[chunk]
-                .expect("chunk for index is not allocated")
-                .as_ptr()
-        };
+        let base = unsafe { Self::allocated_chunk_pointer_unchecked(array, chunk) };
 
         // SAFETY: `offset` is within the selected chunk by construction.
         unsafe { base.add(offset).cast::<T>() }
@@ -777,12 +803,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
             NonNull::<T>::dangling().as_ptr()
         } else {
             // SAFETY: callers only request initialized chunks.
-            unsafe {
-                (*array).chunks[chunk]
-                    .expect("initialized chunk is not allocated")
-                    .as_ptr()
-                    .cast::<T>()
-            }
+            unsafe { Self::allocated_chunk_pointer_unchecked(array, chunk).cast::<T>() }
         };
 
         // SAFETY: the chunk contains `len` initialized elements.
@@ -796,10 +817,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         } else {
             // SAFETY: callers only request initialized chunks.
             unsafe {
-                (*array).chunks[chunk]
-                    .expect("initialized chunk is not allocated")
-                    .as_ptr()
-                    .cast::<T>()
+                Self::allocated_chunk_pointer_unchecked(array.cast_const(), chunk).cast::<T>()
             }
         };
 
@@ -811,14 +829,31 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     fn initialized_len_in_chunk_raw(array: *const Self, chunk: usize) -> usize {
         // SAFETY: caller passes a valid array pointer borrowed from `self`.
         let len = unsafe { (*array).len };
-        let start = Self::chunk_start(chunk);
+        let start = Self::chunk_start_unchecked(chunk);
 
         if len <= start {
             return 0;
         }
 
-        let capacity = Self::chunk_capacity(chunk).expect("initialized chunk has capacity");
+        let capacity = Self::chunk_capacity_unchecked(chunk);
         (len - start).min(capacity)
+    }
+
+    unsafe fn allocated_chunk_pointer_unchecked(
+        array: *const Self,
+        chunk: usize,
+    ) -> *mut MaybeUninit<T> {
+        debug_assert!(chunk < CHUNKS);
+
+        // SAFETY: the caller guarantees that `chunk` is within the fixed chunk
+        // pointer table and that the selected chunk has already been allocated.
+        unsafe {
+            (*array)
+                .chunks
+                .get_unchecked(chunk)
+                .unwrap_unchecked()
+                .as_ptr()
+        }
     }
 }
 

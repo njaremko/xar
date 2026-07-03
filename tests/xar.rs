@@ -13,7 +13,7 @@ fn draw_values(tc: &hegel::TestCase, max_size: usize) -> Vec<i32> {
 }
 
 fn expected_chunk_capacity(base_shift: usize, chunk: usize) -> usize {
-    let shift = base_shift + chunk;
+    let shift = base_shift + chunk.saturating_sub(1);
     assert!(shift < usize::BITS as usize);
     1usize << shift
 }
@@ -516,7 +516,23 @@ fn chunks_report_contiguous_initialized_segments() {
     let xs = (0..10).collect::<ExponentialArray<_, 2, 4>>();
     let chunks = xs.chunks().map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
 
-    assert_eq!(chunks, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7, 8, 9]]);
+    assert_eq!(chunks, vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]]);
+}
+
+#[test]
+fn chunks_follow_power_range_layout() {
+    let xs = (0..32).collect::<ExponentialArray<_, 2, 5>>();
+    let chunks = xs.chunks().map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
+
+    assert_eq!(
+        chunks,
+        vec![
+            (0..4).collect::<Vec<_>>(),
+            (4..8).collect::<Vec<_>>(),
+            (8..16).collect::<Vec<_>>(),
+            (16..32).collect::<Vec<_>>(),
+        ]
+    );
 }
 
 #[test]
@@ -574,21 +590,20 @@ fn supports_zero_sized_types() {
 #[test]
 fn capacity_errors_return_original_value() {
     let mut xs = ExponentialArray::<u8, 0, 2>::new();
-    assert_eq!(ExponentialArray::<u8, 0, 2>::max_capacity(), 3);
+    assert_eq!(ExponentialArray::<u8, 0, 2>::max_capacity(), 2);
 
     assert_eq!(xs.push(1), 0);
     assert_eq!(xs.push(2), 1);
-    assert_eq!(xs.push(3), 2);
 
-    let error = xs.try_push(4).unwrap_err();
+    let error = xs.try_push(3).unwrap_err();
     let (value, reserve_error) = error.into_parts();
 
-    assert_eq!(value, 4);
+    assert_eq!(value, 3);
     assert_eq!(
         reserve_error.kind(),
         TryReserveErrorKind::CapacityExceeded {
-            requested: 4,
-            max: 3,
+            requested: 3,
+            max: 2,
         }
     );
 }
