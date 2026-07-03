@@ -79,3 +79,8 @@ Licensed under either of:
 
 - Apache License, Version 2.0
 - MIT license
+
+## Acknowledgment
+
+The core segmented exponential-array algorithm is based on Andrew Reece's
+discussion of XArray: <https://www.youtube.com/watch?v=i-h95QIGchY>.
