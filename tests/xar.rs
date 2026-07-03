@@ -35,6 +35,22 @@ fn expected_allocated_chunks(
     allocated_chunks
 }
 
+fn expected_i32_chunks(base_shift: usize, values: &[i32]) -> Vec<Vec<i32>> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut chunk = 0usize;
+
+    while start < values.len() {
+        let capacity = expected_chunk_capacity(base_shift, chunk);
+        let end = values.len().min(start + capacity);
+        chunks.push(values[start..end].to_vec());
+        start = end;
+        chunk += 1;
+    }
+
+    chunks
+}
+
 fn assert_i32_array_matches_vec<const BASE_SHIFT: usize, const CHUNKS: usize>(
     array: &ExponentialArray<i32, BASE_SHIFT, CHUNKS>,
     expected: &[i32],
@@ -76,6 +92,50 @@ impl XarVecMachine {
         let index = self.array.try_push(value).unwrap();
         self.model.push(value);
         assert_eq!(index, self.model.len() - 1);
+    }
+
+    #[rule]
+    fn push_with(&mut self, tc: hegel::TestCase) {
+        let value = tc.draw(gs::integers::<i32>());
+        let calls = Cell::new(0);
+        let index = self.array.push_with(|| {
+            calls.set(calls.get() + 1);
+            value
+        });
+
+        self.model.push(value);
+        assert_eq!(index, self.model.len() - 1);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[rule]
+    fn push_mut(&mut self, tc: hegel::TestCase) {
+        let initial = tc.draw(gs::integers::<i32>());
+        let replacement = tc.draw(gs::integers::<i32>());
+        let index = self.model.len();
+
+        {
+            let pushed = self.array.push_mut(initial);
+            assert_eq!(*pushed, initial);
+            *pushed = replacement;
+        }
+
+        self.model.push(replacement);
+        assert_eq!(self.array.get(index), Some(&replacement));
+    }
+
+    #[rule]
+    fn push_ptr(&mut self, tc: hegel::TestCase) {
+        let initial = tc.draw(gs::integers::<i32>());
+        let replacement = tc.draw(gs::integers::<i32>());
+        let index = self.model.len();
+        let pointer = self.array.push_ptr(initial);
+
+        assert_eq!(unsafe { *pointer.as_ptr() }, initial);
+        unsafe { *pointer.as_ptr() = replacement };
+
+        self.model.push(replacement);
+        assert_eq!(self.array.ptr(index), Some(pointer));
     }
 
     #[rule]
@@ -214,6 +274,95 @@ fn chunks_mut_visit_each_element_once(tc: hegel::TestCase) {
 }
 
 #[hegel::test(test_cases = 128)]
+fn chunks_double_ended_iterator_matches_documented_partition(tc: hegel::TestCase) {
+    let values = draw_values(&tc, 300);
+    let expected_chunks = expected_i32_chunks(2, &values);
+    let operations = tc.draw(gs::vecs(gs::booleans()).max_size(expected_chunks.len() + 8));
+    let array = values.into_iter().collect::<PropertyArray<_>>();
+    let mut expected = VecDeque::from(expected_chunks);
+    let mut chunks = array.chunks();
+
+    for take_back in operations {
+        assert_eq!(chunks.len(), expected.len());
+        let actual = if take_back {
+            chunks.next_back().map(<[i32]>::to_vec)
+        } else {
+            chunks.next().map(<[i32]>::to_vec)
+        };
+        let expected_chunk = if take_back {
+            expected.pop_back()
+        } else {
+            expected.pop_front()
+        };
+
+        assert_eq!(actual, expected_chunk);
+    }
+
+    assert_eq!(
+        chunks.map(<[i32]>::to_vec).collect::<Vec<_>>(),
+        expected.into_iter().collect::<Vec<_>>()
+    );
+}
+
+#[hegel::test(test_cases = 128)]
+fn chunks_mut_double_ended_iterator_visits_each_chunk_once(tc: hegel::TestCase) {
+    let values = draw_values(&tc, 300);
+    let delta = tc.draw(gs::integers::<i32>());
+    let expected_chunks = expected_i32_chunks(2, &values);
+    let operations = tc.draw(gs::vecs(gs::booleans()).max_size(expected_chunks.len() + 8));
+    let mut expected = values.clone();
+    let mut array = values.into_iter().collect::<PropertyArray<_>>();
+    let mut expected_queue = VecDeque::from(expected_chunks);
+    let mut visited = 0usize;
+
+    {
+        let mut chunks = array.chunks_mut();
+        for take_back in operations {
+            assert_eq!(chunks.len(), expected_queue.len());
+            let actual = if take_back {
+                chunks.next_back()
+            } else {
+                chunks.next()
+            };
+            let expected_chunk = if take_back {
+                expected_queue.pop_back()
+            } else {
+                expected_queue.pop_front()
+            };
+
+            match (actual, expected_chunk) {
+                (Some(chunk), Some(expected_chunk)) => {
+                    assert_eq!(chunk, expected_chunk.as_slice());
+                    visited += expected_chunk.len();
+                    for value in chunk {
+                        *value = value.wrapping_add(delta);
+                    }
+                }
+                (None, None) => {}
+                (actual, expected_chunk) => {
+                    panic!("chunk iterator mismatch: {actual:?} != {expected_chunk:?}")
+                }
+            }
+        }
+
+        for (chunk, expected_chunk) in chunks.zip(expected_queue) {
+            assert_eq!(chunk, expected_chunk.as_slice());
+            visited += expected_chunk.len();
+            for value in chunk {
+                *value = value.wrapping_add(delta);
+            }
+        }
+    }
+
+    for value in &mut expected {
+        *value = value.wrapping_add(delta);
+    }
+
+    assert_eq!(visited, expected.len());
+    assert_i32_array_matches_vec(&array, &expected);
+}
+
+#[hegel::test(test_cases = 128)]
 fn shared_double_ended_iterator_matches_vec_deque(tc: hegel::TestCase) {
     let values = draw_values(&tc, 300);
     let operations = tc.draw(gs::vecs(gs::booleans()).max_size(values.len() + 16));
@@ -240,6 +389,53 @@ fn shared_double_ended_iterator_matches_vec_deque(tc: hegel::TestCase) {
         iter.copied().collect::<Vec<_>>(),
         model.into_iter().collect::<Vec<_>>()
     );
+}
+
+#[hegel::test(test_cases = 128)]
+fn mutable_double_ended_iterator_matches_vec_deque(tc: hegel::TestCase) {
+    let values = draw_values(&tc, 300);
+    let operations = tc.draw(gs::vecs(gs::booleans()).max_size(values.len() + 16));
+    let delta = tc.draw(gs::integers::<i32>());
+    let mut expected = values.clone();
+    let mut indexes = VecDeque::from_iter(0..values.len());
+    let mut array = values.into_iter().collect::<PropertyArray<_>>();
+
+    {
+        let mut iter = array.iter_mut();
+        for take_back in operations {
+            assert_eq!(iter.len(), indexes.len());
+            let actual = if take_back {
+                iter.next_back()
+            } else {
+                iter.next()
+            };
+            let expected_index = if take_back {
+                indexes.pop_back()
+            } else {
+                indexes.pop_front()
+            };
+
+            match (actual, expected_index) {
+                (Some(value), Some(index)) => {
+                    assert_eq!(*value, expected[index]);
+                    *value = value.wrapping_add(delta);
+                    expected[index] = expected[index].wrapping_add(delta);
+                }
+                (None, None) => {}
+                (actual, expected_index) => {
+                    panic!("mutable iterator mismatch: {actual:?} != {expected_index:?}")
+                }
+            }
+        }
+
+        for (value, index) in iter.zip(indexes) {
+            assert_eq!(*value, expected[index]);
+            *value = value.wrapping_add(delta);
+            expected[index] = expected[index].wrapping_add(delta);
+        }
+    }
+
+    assert_i32_array_matches_vec(&array, &expected);
 }
 
 #[hegel::test(test_cases = 128)]
@@ -271,6 +467,23 @@ fn owning_double_ended_iterator_drops_each_element_once(tc: hegel::TestCase) {
 
     drop(iter);
     assert_eq!(drops.get(), len);
+}
+
+#[hegel::test(test_cases = 128)]
+fn unchecked_accessors_match_checked_access_for_valid_indices(tc: hegel::TestCase) {
+    let values = tc.draw(gs::vecs(gs::integers::<i32>()).min_size(1).max_size(300));
+    let index = tc.draw(gs::integers::<usize>().max_value(values.len() - 1));
+    let replacement = tc.draw(gs::integers::<i32>());
+    let mut expected = values.clone();
+    let mut array = values.into_iter().collect::<PropertyArray<_>>();
+
+    assert_eq!(unsafe { *array.get_unchecked(index) }, expected[index]);
+    assert_eq!(unsafe { *array.get_unchecked_mut(index) }, expected[index]);
+
+    unsafe { *array.get_unchecked_mut(index) = replacement };
+    expected[index] = replacement;
+
+    assert_i32_array_matches_vec(&array, &expected);
 }
 
 #[hegel::test(test_cases = 128)]
@@ -374,6 +587,28 @@ fn try_reserve_overflow_preserves_existing_elements(tc: hegel::TestCase) {
 }
 
 #[hegel::test(test_cases = 128)]
+fn try_with_capacity_reports_capacity_bounds(tc: hegel::TestCase) {
+    let max = TinyArray::<u8>::max_capacity();
+    let requested = tc.draw(gs::integers::<usize>().max_value(max + 4));
+    let result = TinyArray::<u8>::try_with_capacity(requested);
+
+    if requested <= max {
+        let array = result.unwrap();
+        assert_eq!(array.len(), 0);
+        assert!(array.capacity() >= requested);
+        assert_eq!(
+            array.allocated_chunks(),
+            expected_allocated_chunks(0, 3, requested)
+        );
+    } else {
+        assert_eq!(
+            result.unwrap_err().kind(),
+            TryReserveErrorKind::CapacityExceeded { requested, max }
+        );
+    }
+}
+
+#[hegel::test(test_cases = 128)]
 fn try_push_with_calls_closure_only_after_reservation_succeeds(tc: hegel::TestCase) {
     let max = TinyArray::<i32>::max_capacity();
     let len = tc.draw(gs::integers::<usize>().max_value(max));
@@ -405,6 +640,34 @@ fn try_push_with_calls_closure_only_after_reservation_succeeds(tc: hegel::TestCa
         assert_eq!(calls.get(), 0);
         assert_eq!(array.len(), max);
     }
+}
+
+#[hegel::test(test_cases = 128)]
+fn try_push_returns_original_value_when_capacity_is_full(tc: hegel::TestCase) {
+    let max = TinyArray::<i32>::max_capacity();
+    let values = tc.draw(gs::vecs(gs::integers::<i32>()).min_size(max).max_size(max));
+    let rejected = tc.draw(gs::integers::<i32>());
+    let mut array = TinyArray::new();
+
+    for (index, value) in values.iter().copied().enumerate() {
+        assert_eq!(array.try_push(value).unwrap(), index);
+    }
+
+    let capacity_before = array.capacity();
+    let error = array.try_push(rejected).unwrap_err();
+    let (value, reserve_error) = error.into_parts();
+
+    assert_eq!(value, rejected);
+    assert_eq!(
+        reserve_error.kind(),
+        TryReserveErrorKind::CapacityExceeded {
+            requested: max + 1,
+            max,
+        }
+    );
+    assert_eq!(array.len(), max);
+    assert_eq!(array.capacity(), capacity_before);
+    assert_eq!(array.iter().copied().collect::<Vec<_>>(), values);
 }
 
 #[test]
