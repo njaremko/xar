@@ -83,4 +83,5 @@ Licensed under either of:
 ## Acknowledgment
 
 The core segmented exponential-array algorithm is based on Andrew Reece's
-discussion of XArray: <https://www.youtube.com/watch?v=i-h95QIGchY>.
+discussion of exponential arrays (`xar`):
+<https://www.youtube.com/watch?v=i-h95QIGchY>.
