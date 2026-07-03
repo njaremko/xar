@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use hegel::generators as gs;
@@ -481,6 +482,175 @@ fn pop_and_truncate_drop_tail() {
 
     drop(xs);
     assert_eq!(drops.get(), 10);
+}
+
+#[test]
+fn push_resumes_at_tail_after_pop_truncate_and_clear() {
+    let mut xs = (0..10).collect::<ExponentialArray<_, 2, 4>>();
+
+    assert_eq!(xs.pop(), Some(9));
+    assert_eq!(xs.pop(), Some(8));
+    assert_eq!(xs.push(90), 8);
+    assert_eq!(xs.push(91), 9);
+    assert_eq!(
+        xs.iter().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 90, 91]
+    );
+
+    xs.truncate(5);
+    assert_eq!(xs.push(50), 5);
+    assert_eq!(xs.push(51), 6);
+    assert_eq!(xs.push(52), 7);
+    assert_eq!(xs.push(80), 8);
+    assert_eq!(
+        xs.chunks().map(|chunk| chunk.to_vec()).collect::<Vec<_>>(),
+        vec![vec![0, 1, 2, 3], vec![4, 50, 51, 52], vec![80]]
+    );
+
+    xs.clear();
+    assert_eq!(xs.push(7), 0);
+    assert_eq!(xs.iter().copied().collect::<Vec<_>>(), vec![7]);
+}
+
+#[test]
+fn append_constructors_append_and_observe_tail_element() {
+    let mut xs = ExponentialArray::<_, 2, 4>::new();
+
+    assert_eq!(xs.push(10), 0);
+
+    let pushed_mut = xs.push_mut(20);
+    assert_eq!(*pushed_mut, 20);
+    *pushed_mut = 21;
+
+    let pushed_ptr = xs.push_ptr(30);
+    assert_eq!(unsafe { *pushed_ptr.as_ptr() }, 30);
+    unsafe { *pushed_ptr.as_ptr() = 31 };
+
+    assert_eq!(xs.push_with(|| 40), 3);
+    assert_eq!(xs.try_push(50).unwrap(), 4);
+    assert_eq!(xs.try_push_with(|| 60).unwrap(), 5);
+    assert_eq!(
+        xs.iter().copied().collect::<Vec<_>>(),
+        vec![10, 21, 31, 40, 50, 60]
+    );
+}
+
+#[test]
+fn mutable_double_ended_iterator_matches_vec_deque_order() {
+    let mut xs = (0..10).collect::<ExponentialArray<_, 2, 4>>();
+    let mut model = VecDeque::from_iter(0..10);
+    let operations = [false, true, false, true, true, false, false, true];
+
+    let mut observed = Vec::new();
+    let mut expected_observed = Vec::new();
+    {
+        let mut iter = xs.iter_mut();
+        for take_back in operations {
+            assert_eq!(iter.len(), model.len());
+            let expected = if take_back {
+                model.pop_back().unwrap()
+            } else {
+                model.pop_front().unwrap()
+            };
+            let value = if take_back {
+                let value = iter.next_back().unwrap();
+                assert_eq!(*value, expected);
+                value
+            } else {
+                let value = iter.next().unwrap();
+                assert_eq!(*value, expected);
+                value
+            };
+            expected_observed.push(expected);
+            observed.push(*value);
+            *value += 100;
+        }
+
+        let remaining = iter
+            .map(|value| {
+                let old_value = *value;
+                *value += 100;
+                old_value
+            })
+            .collect::<Vec<_>>();
+        expected_observed.extend(model.into_iter());
+        observed.extend(remaining);
+    }
+
+    assert_eq!(observed, expected_observed);
+    assert_eq!(
+        xs.iter().copied().collect::<Vec<_>>(),
+        (100..110).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn owning_double_ended_iterator_matches_vec_deque_order() {
+    let xs = (0..10).collect::<ExponentialArray<_, 2, 4>>();
+    let mut model = VecDeque::from_iter(0..10);
+    let operations = [false, true, true, false, false, true];
+    let mut iter = xs.into_iter();
+
+    for take_back in operations {
+        assert_eq!(iter.len(), model.len());
+        let actual = if take_back {
+            iter.next_back()
+        } else {
+            iter.next()
+        };
+        let expected = if take_back {
+            model.pop_back()
+        } else {
+            model.pop_front()
+        };
+        assert_eq!(actual, expected);
+    }
+
+    assert_eq!(
+        iter.collect::<Vec<_>>(),
+        model.into_iter().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn clear_drops_later_chunks_when_destructor_panics() {
+    struct PanicOnce {
+        id: usize,
+        panicked: Rc<Cell<bool>>,
+        drops: Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl Drop for PanicOnce {
+        fn drop(&mut self) {
+            self.drops.borrow_mut().push(self.id);
+            if self.id == 0 && !self.panicked.replace(true) {
+                panic!("drop panic for test");
+            }
+        }
+    }
+
+    let panicked = Rc::new(Cell::new(false));
+    let drops = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut xs = ExponentialArray::<_, 1, 4>::new();
+    for id in 0..6 {
+        xs.push(PanicOnce {
+            id,
+            panicked: panicked.clone(),
+            drops: drops.clone(),
+        });
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| xs.clear()));
+    assert!(result.is_err());
+
+    let mut actual = drops.borrow().clone();
+    actual.sort_unstable();
+    assert_eq!(actual, vec![0, 1, 2, 3, 4, 5]);
+
+    drop(xs);
+    let mut actual = drops.borrow().clone();
+    actual.sort_unstable();
+    assert_eq!(actual, vec![0, 1, 2, 3, 4, 5]);
 }
 
 #[test]

@@ -134,6 +134,13 @@ pub type Xar<T> = ExponentialArray<T, DEFAULT_BASE_SHIFT, DEFAULT_CHUNKS>;
 /// The whole array is not contiguous. Each individual chunk is contiguous.
 pub struct ExponentialArray<T, const BASE_SHIFT: usize, const CHUNKS: usize> {
     len: usize,
+    // Saturating sum of capacities for the allocated prefix
+    // `chunks[..allocated_chunks]`.
+    capacity: usize,
+    allocated_chunks: usize,
+    // Cursor for the next append slot; equivalent to `end_position(len)`.
+    tail_chunk: usize,
+    tail_offset: usize,
     chunks: [Option<NonNull<MaybeUninit<T>>>; CHUNKS],
 }
 
@@ -285,6 +292,10 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     pub const fn new() -> Self {
         Self {
             len: 0,
+            capacity: 0,
+            allocated_chunks: 0,
+            tail_chunk: 0,
+            tail_offset: 0,
             chunks: [None; CHUNKS],
         }
     }
@@ -323,26 +334,39 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         self.len == 0
     }
 
+    fn debug_assert_invariants(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+
+        debug_assert!(self.len <= self.capacity);
+        debug_assert!(self.allocated_chunks <= CHUNKS);
+
+        let (tail_chunk, tail_offset) = Self::end_position(self.len);
+        debug_assert_eq!(self.tail_chunk, tail_chunk);
+        debug_assert_eq!(self.tail_offset, tail_offset);
+
+        let mut expected_capacity = 0usize;
+        let mut chunk = 0usize;
+        while chunk < self.allocated_chunks {
+            debug_assert!(self.chunks[chunk].is_some());
+            let capacity = Self::chunk_capacity(chunk).expect("allocated chunk is representable");
+            expected_capacity = expected_capacity.saturating_add(capacity);
+            chunk += 1;
+        }
+        debug_assert_eq!(self.capacity, expected_capacity);
+
+        while chunk < CHUNKS {
+            debug_assert!(self.chunks[chunk].is_none());
+            chunk += 1;
+        }
+    }
+
     /// Returns the number of elements that can be held without allocating more
     /// chunks.
     #[must_use]
-    pub fn capacity(&self) -> usize {
-        let mut total = 0usize;
-        let mut chunk = 0usize;
-
-        while chunk < CHUNKS {
-            if self.chunks[chunk].is_none() {
-                break;
-            }
-
-            let Some(capacity) = Self::chunk_capacity(chunk) else {
-                break;
-            };
-            total = total.saturating_add(capacity);
-            chunk += 1;
-        }
-
-        total
+    pub const fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Returns the maximum number of elements this configuration can hold for
@@ -376,12 +400,8 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
 
     /// Returns the number of chunks currently allocated.
     #[must_use]
-    pub fn allocated_chunks(&self) -> usize {
-        let mut count = 0usize;
-        while count < CHUNKS && self.chunks[count].is_some() {
-            count += 1;
-        }
-        count
+    pub const fn allocated_chunks(&self) -> usize {
+        self.allocated_chunks
     }
 
     /// Reserves capacity for at least `additional` more elements.
@@ -404,29 +424,39 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     /// unchanged. Capacity may have increased if allocation of an earlier chunk
     /// succeeded before a later chunk failed.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        let requested = self
+        let requested_capacity = self
             .len
             .checked_add(additional)
             .ok_or_else(TryReserveError::capacity_overflow)?;
 
-        if requested <= self.capacity() {
+        self.debug_assert_invariants();
+
+        if requested_capacity <= self.capacity {
             return Ok(());
         }
 
+        let result = self.try_reserve_slow(requested_capacity);
+        if result.is_ok() {
+            self.debug_assert_invariants();
+        }
+        result
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn try_reserve_slow(&mut self, requested_capacity: usize) -> Result<(), TryReserveError> {
         let max = Self::max_capacity();
-        if requested > max {
-            return Err(TryReserveError::capacity_exceeded(requested, max));
+        if requested_capacity > max {
+            return Err(TryReserveError::capacity_exceeded(requested_capacity, max));
         }
 
-        if requested == 0 {
+        if requested_capacity == 0 {
             return Ok(());
         }
 
-        let (last_chunk, _) = Self::locate(requested - 1);
-        let mut chunk = 0usize;
-        while chunk <= last_chunk {
-            self.try_allocate_chunk(chunk)?;
-            chunk += 1;
+        let (last_chunk, _) = Self::locate(requested_capacity - 1);
+        while self.allocated_chunks <= last_chunk {
+            self.try_allocate_next_chunk()?;
         }
 
         Ok(())
@@ -477,9 +507,13 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     /// Panics if the array is full. On allocation failure, this uses the global
     /// allocation error handler.
     pub fn push_mut(&mut self, value: T) -> &mut T {
-        let index = self.push(value);
-        // SAFETY: `push` initialized `index` and returned it.
-        unsafe { self.get_unchecked_mut(index) }
+        let (index, chunk, offset) = match self.reserve_tail_slot() {
+            Ok(slot) => slot,
+            Err(error) => panic_or_handle_reserve(error),
+        };
+        // SAFETY: reservation above guarantees storage for `index`, and the
+        // returned pointer names the initialized element.
+        unsafe { &mut *self.write_reserved_tail_slot(index, chunk, offset, value) }
     }
 
     /// Appends `value` and returns a stable raw pointer to it.
@@ -493,22 +527,36 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     /// Panics if the array is full. On allocation failure, this uses the global
     /// allocation error handler.
     pub fn push_ptr(&mut self, value: T) -> NonNull<T> {
-        let index = self.push(value);
-        // SAFETY: `push` initialized `index` and the pointer is non-null.
-        unsafe { NonNull::new_unchecked(Self::ptr_at_unchecked_raw(self, index)) }
+        let (index, chunk, offset) = match self.reserve_tail_slot() {
+            Ok(slot) => slot,
+            Err(error) => panic_or_handle_reserve(error),
+        };
+        // SAFETY: reservation above guarantees storage for `index`, and the
+        // returned pointer is non-null.
+        unsafe {
+            NonNull::new_unchecked(self.write_reserved_tail_slot(index, chunk, offset, value))
+        }
     }
 
     /// Tries to append `value` and returns its index.
     pub fn try_push(&mut self, value: T) -> Result<usize, TryPushError<T>> {
-        let index = self.len;
-        if let Err(error) = self.try_reserve(1) {
-            return Err(TryPushError { value, error });
-        }
+        let (index, chunk, offset) = match self.reserve_tail_slot() {
+            Ok(slot) => slot,
+            Err(error) => {
+                return Err(TryPushError { value, error });
+            }
+        };
 
         // SAFETY: reservation above guarantees storage for `index`.
-        unsafe { self.write_at_unchecked(index, value) };
-        self.len = index + 1;
+        unsafe { self.write_reserved_tail_slot(index, chunk, offset, value) };
         Ok(index)
+    }
+
+    fn reserve_tail_slot(&mut self) -> Result<(usize, usize, usize), TryReserveError> {
+        let index = self.len;
+        self.try_reserve(1)?;
+
+        Ok((index, self.tail_chunk, self.tail_offset))
     }
 
     /// Tries to append a value produced by `make_value` and returns its index.
@@ -518,13 +566,11 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     where
         F: FnOnce() -> T,
     {
-        self.try_reserve(1)?;
-        let index = self.len;
+        let (index, chunk, offset) = self.reserve_tail_slot()?;
         let value = make_value();
 
         // SAFETY: reservation above guarantees storage for `index`.
-        unsafe { self.write_at_unchecked(index, value) };
-        self.len = index + 1;
+        unsafe { self.write_reserved_tail_slot(index, chunk, offset, value) };
         Ok(index)
     }
 
@@ -537,10 +583,13 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
             return None;
         }
 
-        self.len -= 1;
+        let index = self.len - 1;
+        let (chunk, offset) = self.retreat_tail_before_pop();
+        self.len = index;
+        self.debug_assert_invariants();
         // SAFETY: the old last element was initialized, and `len` has been
         // reduced so it will not be dropped again.
-        Some(unsafe { Self::ptr_at_unchecked_raw(self, self.len).read() })
+        Some(unsafe { Self::ptr_at_chunk_offset_unchecked(self, chunk, offset).read() })
     }
 
     /// Shortens the array, keeping the first `new_len` elements.
@@ -548,12 +597,20 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     /// If `new_len` is greater than or equal to the current length, this does
     /// nothing. Allocated chunks are retained.
     pub fn truncate(&mut self, new_len: usize) {
-        while self.len > new_len {
-            self.len -= 1;
-            // SAFETY: the element at the old last index was initialized, and
-            // `len` has been reduced so it will not be dropped again.
-            unsafe { ptr::drop_in_place(Self::ptr_at_unchecked_raw(self, self.len)) };
+        if new_len >= self.len {
+            return;
         }
+
+        let old_len = self.len;
+        let (tail_chunk, tail_offset) = Self::end_position(new_len);
+        self.len = new_len;
+        self.tail_chunk = tail_chunk;
+        self.tail_offset = tail_offset;
+        self.debug_assert_invariants();
+        // SAFETY: `new_len..old_len` contains initialized elements, and `len`
+        // has already been shortened so a panic while dropping cannot drop the
+        // same elements again.
+        unsafe { self.drop_range_unchecked(new_len, old_len) };
     }
 
     /// Removes all elements.
@@ -633,8 +690,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     pub fn iter(&self) -> Iter<'_, T, BASE_SHIFT, CHUNKS> {
         Iter {
             array: self,
-            front: 0,
-            back: self.len,
+            cursor: ElementCursor::new::<T, BASE_SHIFT, CHUNKS>(self.len),
             marker: PhantomData,
         }
     }
@@ -644,8 +700,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     pub fn iter_mut(&mut self) -> IterMut<'_, T, BASE_SHIFT, CHUNKS> {
         IterMut {
             array: self,
-            front: 0,
-            back: self.len,
+            cursor: ElementCursor::new::<T, BASE_SHIFT, CHUNKS>(self.len),
             marker: PhantomData,
         }
     }
@@ -684,6 +739,28 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
             0
         } else {
             Self::locate(self.len - 1).0 + 1
+        }
+    }
+
+    fn initial_front_remaining(len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            len.min(Self::chunk_capacity_unchecked(0))
+        }
+    }
+
+    fn end_position(len: usize) -> (usize, usize) {
+        if len == 0 {
+            return (0, 0);
+        }
+
+        let (chunk, offset) = Self::locate(len - 1);
+        let end_offset = offset + 1;
+        if end_offset == Self::chunk_capacity_unchecked(chunk) {
+            (chunk + 1, 0)
+        } else {
+            (chunk, end_offset)
         }
     }
 
@@ -751,15 +828,18 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         (chunk, index - start)
     }
 
-    fn try_allocate_chunk(&mut self, chunk: usize) -> Result<(), TryReserveError> {
+    fn try_allocate_next_chunk(&mut self) -> Result<(), TryReserveError> {
+        let chunk = self.allocated_chunks;
         debug_assert!(chunk < CHUNKS);
+        debug_assert!(self.chunks[chunk].is_none());
 
-        if self.chunks[chunk].is_some() {
-            return Ok(());
-        }
-
+        let capacity =
+            Self::chunk_capacity(chunk).ok_or_else(TryReserveError::capacity_overflow)?;
+        let next_capacity = self.capacity.saturating_add(capacity);
         if mem::size_of::<T>() == 0 {
             self.chunks[chunk] = Some(NonNull::dangling());
+            self.allocated_chunks = chunk + 1;
+            self.capacity = next_capacity;
             return Ok(());
         }
 
@@ -774,12 +854,108 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         };
 
         self.chunks[chunk] = Some(pointer);
+        self.allocated_chunks = chunk + 1;
+        self.capacity = next_capacity;
         Ok(())
     }
 
-    unsafe fn write_at_unchecked(&mut self, index: usize, value: T) {
-        // SAFETY: the caller guarantees the slot exists and is uninitialized.
-        unsafe { Self::ptr_at_unchecked_raw(self, index).write(value) };
+    unsafe fn ptr_at_chunk_offset_unchecked(
+        array: *const Self,
+        chunk: usize,
+        offset: usize,
+    ) -> *mut T {
+        debug_assert!(chunk < CHUNKS);
+        debug_assert!(offset < Self::chunk_capacity_unchecked(chunk));
+
+        if mem::size_of::<T>() == 0 {
+            return NonNull::<T>::dangling().as_ptr();
+        }
+
+        // SAFETY: the caller guarantees that the chunk is allocated and the
+        // offset names an initialized or reserved slot in that chunk.
+        let base = unsafe { Self::allocated_chunk_pointer_unchecked(array, chunk) };
+
+        // SAFETY: guaranteed by the caller.
+        unsafe { base.add(offset).cast::<T>() }
+    }
+
+    unsafe fn write_reserved_tail_slot(
+        &mut self,
+        index: usize,
+        chunk: usize,
+        offset: usize,
+        value: T,
+    ) -> *mut T {
+        debug_assert_eq!(index, self.len);
+        debug_assert_eq!(chunk, self.tail_chunk);
+        debug_assert_eq!(offset, self.tail_offset);
+
+        // SAFETY: the caller reserved the tail slot and passed its cursor.
+        let pointer = unsafe { Self::ptr_at_chunk_offset_unchecked(self, chunk, offset) };
+        // SAFETY: the reserved tail slot is uninitialized.
+        unsafe { pointer.write(value) };
+        self.len = index + 1;
+        self.advance_tail_after_push();
+        self.debug_assert_invariants();
+        pointer
+    }
+
+    fn advance_tail_after_push(&mut self) {
+        debug_assert!(self.tail_chunk < CHUNKS);
+        debug_assert!(self.tail_offset < Self::chunk_capacity_unchecked(self.tail_chunk));
+
+        self.tail_offset += 1;
+        if self.tail_offset == Self::chunk_capacity_unchecked(self.tail_chunk) {
+            self.tail_chunk += 1;
+            self.tail_offset = 0;
+        }
+    }
+
+    fn retreat_tail_before_pop(&mut self) -> (usize, usize) {
+        debug_assert!(self.len > 0);
+        debug_assert!(self.tail_chunk <= CHUNKS);
+
+        if self.tail_offset == 0 {
+            debug_assert!(self.tail_chunk > 0);
+            self.tail_chunk -= 1;
+            self.tail_offset = Self::chunk_capacity_unchecked(self.tail_chunk);
+        }
+
+        self.tail_offset -= 1;
+        (self.tail_chunk, self.tail_offset)
+    }
+
+    unsafe fn drop_range_unchecked(&mut self, start: usize, end: usize) {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.capacity);
+
+        if start == end || !mem::needs_drop::<T>() {
+            return;
+        }
+
+        let array = self as *mut Self;
+        let mut guard = DropRangeGuard { array, start, end };
+
+        while guard.start < guard.end {
+            let (chunk, offset) = Self::locate(guard.start);
+            let chunk_end = Self::chunk_start_unchecked(chunk)
+                .saturating_add(Self::chunk_capacity_unchecked(chunk));
+            let range_end = guard.end.min(chunk_end);
+            let count = range_end - guard.start;
+            let pointer = if mem::size_of::<T>() == 0 {
+                NonNull::<T>::dangling().as_ptr()
+            } else {
+                // SAFETY: the range is initialized and contained in this
+                // chunk by construction.
+                unsafe { Self::ptr_at_chunk_offset_unchecked(array.cast_const(), chunk, offset) }
+            };
+
+            guard.start = range_end;
+            // SAFETY: `pointer..pointer + count` names initialized elements in
+            // one contiguous chunk. The guard already points at the next chunk,
+            // so unwinding cannot strand later chunks.
+            unsafe { ptr::drop_in_place(slice::from_raw_parts_mut(pointer, count)) };
+        }
     }
 
     unsafe fn ptr_at_unchecked_raw(array: *const Self, index: usize) -> *mut T {
@@ -788,13 +964,9 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         }
 
         let (chunk, offset) = Self::locate(index);
-
         // SAFETY: callers only request initialized/reserved indices, and all
         // chunks up to that index have been allocated.
-        let base = unsafe { Self::allocated_chunk_pointer_unchecked(array, chunk) };
-
-        // SAFETY: `offset` is within the selected chunk by construction.
-        unsafe { base.add(offset).cast::<T>() }
+        unsafe { Self::ptr_at_chunk_offset_unchecked(array, chunk, offset) }
     }
 
     unsafe fn chunk_slice_from_raw<'a>(array: *const Self, chunk: usize) -> &'a [T] {
@@ -857,6 +1029,28 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     }
 }
 
+struct DropRangeGuard<T, const BASE_SHIFT: usize, const CHUNKS: usize> {
+    array: *mut ExponentialArray<T, BASE_SHIFT, CHUNKS>,
+    start: usize,
+    end: usize,
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop
+    for DropRangeGuard<T, BASE_SHIFT, CHUNKS>
+{
+    fn drop(&mut self) {
+        if self.start == self.end || !mem::needs_drop::<T>() {
+            return;
+        }
+
+        // SAFETY: the guard is created only by `drop_range_unchecked` while the
+        // range names initialized elements. If this runs during unwinding, the
+        // current chunk has already been handed to slice drop glue and
+        // `start..end` covers only later chunks.
+        unsafe { (*self.array).drop_range_unchecked(self.start, self.end) };
+    }
+}
+
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Default
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
 {
@@ -876,10 +1070,10 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop
         }
 
         let mut chunk = 0usize;
-        while chunk < CHUNKS {
+        while chunk < self.allocated_chunks {
             if let Some(pointer) = self.chunks[chunk] {
                 if let Ok(layout) = Self::chunk_layout(chunk) {
-                    // SAFETY: chunks are allocated by `try_allocate_chunk` with
+                    // SAFETY: chunks are allocated by `try_allocate_next_chunk` with
                     // this exact layout and have not been deallocated yet.
                     unsafe { dealloc(pointer.as_ptr().cast::<u8>(), layout) };
                 }
@@ -1034,11 +1228,12 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> IntoIterator
     fn into_iter(mut self) -> Self::IntoIter {
         let len = self.len;
         self.len = 0;
+        self.tail_chunk = 0;
+        self.tail_offset = 0;
 
         IntoIter {
             array: self,
-            front: 0,
-            back: len,
+            cursor: ElementCursor::new::<T, BASE_SHIFT, CHUNKS>(len),
         }
     }
 }
@@ -1065,11 +1260,86 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> IntoIterator
     }
 }
 
+#[derive(Clone, Copy)]
+struct ElementCursor {
+    front: usize,
+    back: usize,
+    front_chunk: usize,
+    front_offset: usize,
+    front_remaining_in_chunk: usize,
+    back_chunk: usize,
+    back_offset: usize,
+}
+
+impl ElementCursor {
+    fn new<T, const BASE_SHIFT: usize, const CHUNKS: usize>(len: usize) -> Self {
+        let (back_chunk, back_offset) =
+            ExponentialArray::<T, BASE_SHIFT, CHUNKS>::end_position(len);
+        Self {
+            front: 0,
+            back: len,
+            front_chunk: 0,
+            front_offset: 0,
+            front_remaining_in_chunk:
+                ExponentialArray::<T, BASE_SHIFT, CHUNKS>::initial_front_remaining(len),
+            back_chunk,
+            back_offset,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.back - self.front
+    }
+
+    fn next_front<T, const BASE_SHIFT: usize, const CHUNKS: usize>(
+        &mut self,
+    ) -> Option<(usize, usize)> {
+        if self.front == self.back {
+            return None;
+        }
+
+        let chunk = self.front_chunk;
+        let offset = self.front_offset;
+        self.front += 1;
+        self.front_offset += 1;
+        self.front_remaining_in_chunk -= 1;
+        if self.front_remaining_in_chunk == 0 && self.front != self.back {
+            self.front_chunk += 1;
+            self.front_offset = 0;
+            self.front_remaining_in_chunk = self.len().min(
+                ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_capacity_unchecked(
+                    self.front_chunk,
+                ),
+            );
+        }
+
+        Some((chunk, offset))
+    }
+
+    fn next_back<T, const BASE_SHIFT: usize, const CHUNKS: usize>(
+        &mut self,
+    ) -> Option<(usize, usize)> {
+        if self.front == self.back {
+            return None;
+        }
+
+        self.back -= 1;
+        if self.back_offset == 0 {
+            self.back_chunk -= 1;
+            self.back_offset = ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_capacity_unchecked(
+                self.back_chunk,
+            );
+        }
+        self.back_offset -= 1;
+
+        Some((self.back_chunk, self.back_offset))
+    }
+}
+
 /// An iterator over shared references in an [`ExponentialArray`].
 pub struct Iter<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> {
     array: *const ExponentialArray<T, BASE_SHIFT, CHUNKS>,
-    front: usize,
-    back: usize,
+    cursor: ElementCursor,
     marker: PhantomData<&'a T>,
 }
 
@@ -1089,16 +1359,13 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> Iterator
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        let index = self.front;
-        self.front += 1;
+        let (chunk, offset) = self.cursor.next_front::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: iterator bounds are initialized indices and each yielded
         // shared reference is valid for `'a`.
-        Some(unsafe { &*ExponentialArray::ptr_at_unchecked_raw(self.array, index) })
+        Some(unsafe {
+            &*ExponentialArray::ptr_at_chunk_offset_unchecked(self.array, chunk, offset)
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1111,15 +1378,13 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> DoubleEndedIterator
     for Iter<'a, T, BASE_SHIFT, CHUNKS>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        self.back -= 1;
+        let (chunk, offset) = self.cursor.next_back::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: iterator bounds are initialized indices and each yielded
         // shared reference is valid for `'a`.
-        Some(unsafe { &*ExponentialArray::ptr_at_unchecked_raw(self.array, self.back) })
+        Some(unsafe {
+            &*ExponentialArray::ptr_at_chunk_offset_unchecked(self.array, chunk, offset)
+        })
     }
 }
 
@@ -1127,7 +1392,7 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> ExactSizeIterator
     for Iter<'a, T, BASE_SHIFT, CHUNKS>
 {
     fn len(&self) -> usize {
-        self.back - self.front
+        self.cursor.len()
     }
 }
 
@@ -1139,8 +1404,7 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> FusedIterator
 /// An iterator over mutable references in an [`ExponentialArray`].
 pub struct IterMut<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> {
     array: *mut ExponentialArray<T, BASE_SHIFT, CHUNKS>,
-    front: usize,
-    back: usize,
+    cursor: ElementCursor,
     marker: PhantomData<&'a mut T>,
 }
 
@@ -1150,16 +1414,13 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> Iterator
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        let index = self.front;
-        self.front += 1;
+        let (chunk, offset) = self.cursor.next_front::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: the mutable iterator has exclusive access to the array and
         // yields each index at most once.
-        Some(unsafe { &mut *ExponentialArray::ptr_at_unchecked_raw(self.array, index) })
+        Some(unsafe {
+            &mut *ExponentialArray::ptr_at_chunk_offset_unchecked(self.array, chunk, offset)
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1172,15 +1433,13 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> DoubleEndedIterator
     for IterMut<'a, T, BASE_SHIFT, CHUNKS>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        self.back -= 1;
+        let (chunk, offset) = self.cursor.next_back::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: the mutable iterator has exclusive access to the array and
         // yields each index at most once.
-        Some(unsafe { &mut *ExponentialArray::ptr_at_unchecked_raw(self.array, self.back) })
+        Some(unsafe {
+            &mut *ExponentialArray::ptr_at_chunk_offset_unchecked(self.array, chunk, offset)
+        })
     }
 }
 
@@ -1188,7 +1447,7 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> ExactSizeIterator
     for IterMut<'a, T, BASE_SHIFT, CHUNKS>
 {
     fn len(&self) -> usize {
-        self.back - self.front
+        self.cursor.len()
     }
 }
 
@@ -1333,24 +1592,20 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> FusedIterator
 /// An owning iterator over an [`ExponentialArray`].
 pub struct IntoIter<T, const BASE_SHIFT: usize, const CHUNKS: usize> {
     array: ExponentialArray<T, BASE_SHIFT, CHUNKS>,
-    front: usize,
-    back: usize,
+    cursor: ElementCursor,
 }
 
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Iterator for IntoIter<T, BASE_SHIFT, CHUNKS> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        let index = self.front;
-        self.front += 1;
+        let (chunk, offset) = self.cursor.next_front::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: `front..back` contains initialized elements owned by this
         // iterator. Each index is read at most once.
-        Some(unsafe { ExponentialArray::ptr_at_unchecked_raw(&self.array, index).read() })
+        Some(unsafe {
+            ExponentialArray::ptr_at_chunk_offset_unchecked(&self.array, chunk, offset).read()
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1363,15 +1618,13 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> DoubleEndedIterator
     for IntoIter<T, BASE_SHIFT, CHUNKS>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front == self.back {
-            return None;
-        }
-
-        self.back -= 1;
+        let (chunk, offset) = self.cursor.next_back::<T, BASE_SHIFT, CHUNKS>()?;
 
         // SAFETY: `front..back` contains initialized elements owned by this
         // iterator. Each index is read at most once.
-        Some(unsafe { ExponentialArray::ptr_at_unchecked_raw(&self.array, self.back).read() })
+        Some(unsafe {
+            ExponentialArray::ptr_at_chunk_offset_unchecked(&self.array, chunk, offset).read()
+        })
     }
 }
 
@@ -1379,7 +1632,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExactSizeIterator
     for IntoIter<T, BASE_SHIFT, CHUNKS>
 {
     fn len(&self) -> usize {
-        self.back - self.front
+        self.cursor.len()
     }
 }
 
@@ -1390,20 +1643,18 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> FusedIterator
 
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop for IntoIter<T, BASE_SHIFT, CHUNKS> {
     fn drop(&mut self) {
-        while self.front != self.back {
-            // SAFETY: remaining indices contain initialized elements owned by
-            // this iterator and have not been read.
-            unsafe {
-                ptr::drop_in_place(ExponentialArray::ptr_at_unchecked_raw(
-                    &self.array,
-                    self.front,
-                ));
-            }
-            self.front += 1;
-        }
+        let front = self.cursor.front;
+        let back = self.cursor.back;
+        self.cursor.front = back;
+        // SAFETY: `front..back` contains initialized elements owned by this
+        // iterator and not yet yielded. Advancing `front` first prevents a
+        // double drop if element destruction panics.
+        unsafe { self.array.drop_range_unchecked(front, back) };
     }
 }
 
+#[cold]
+#[inline(never)]
 fn panic_or_handle_reserve(error: TryReserveError) -> ! {
     match error.kind() {
         TryReserveErrorKind::AllocError { size, align } => {
