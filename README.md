@@ -47,6 +47,30 @@ The public API follows common Rust container conventions:
 `push` returns the appended element's index. Use `push_mut` for an immediate
 mutable reference or `push_ptr` for an immediate stable raw pointer.
 
+## Benchmarks
+
+The crate includes Divan benchmarks comparing `Xar<u64>` against `Vec<u64>` for
+append, reserved append, iteration, indexed access, and pop-all workloads:
+
+```sh
+cargo bench --bench xar_vs_vec -- --sample-count 30 --skip-ext-time
+```
+
+Representative medians from an `aarch64-apple-darwin` release build with
+`rustc 1.95.0-nightly (f60a0f1bc 2026-02-02)`, using 1,048,576 elements:
+
+| Workload | `Xar` median | `Vec` median | Shape |
+| --- | ---: | ---: | --- |
+| `push_empty` | 863.7 us | 1.560 ms | `Xar` avoids contiguous reallocation |
+| `push_reserved` | 885.4 us | 1.077 ms | `Xar` appends into allocated chunks |
+| `iter_sum` | 289.0 us | 289.2 us | chunk-sliced iteration is Vec-like |
+| `indexed_sum` | 1.194 ms | 923.9 us | `Vec` has cheaper indexed addressing |
+| `pop_all` | 1.983 ms | 1.191 ms | `Vec` has a simpler contiguous tail |
+
+These numbers are machine-dependent. The intended performance profile is stable
+addresses with strong append behavior and efficient chunk iteration, not a
+universal replacement for contiguous `Vec` storage.
+
 ## Configuration
 
 `Xar<T>` is a type alias:
