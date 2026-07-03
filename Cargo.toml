@@ -20,4 +20,9 @@ default = ["std"]
 std = []
 
 [dev-dependencies]
+divan = "0.1.21"
 hegeltest = "0.23.2"
+
+[[bench]]
+name = "xar_vs_vec"
+harness = false
