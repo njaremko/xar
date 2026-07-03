@@ -954,7 +954,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
             // SAFETY: `pointer..pointer + count` names initialized elements in
             // one contiguous chunk. The guard already points at the next chunk,
             // so unwinding cannot strand later chunks.
-            unsafe { ptr::drop_in_place(slice::from_raw_parts_mut(pointer, count)) };
+            unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(pointer, count)) };
         }
     }
 
@@ -971,30 +971,60 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
 
     unsafe fn chunk_slice_from_raw<'a>(array: *const Self, chunk: usize) -> &'a [T] {
         let len = Self::initialized_len_in_chunk_raw(array, chunk);
+        // SAFETY: callers only request initialized chunks, starting at offset
+        // zero and spanning the initialized prefix of the chunk.
+        unsafe { Self::chunk_slice_range_from_raw(array, chunk, 0, len) }
+    }
+
+    unsafe fn chunk_slice_range_from_raw<'a>(
+        array: *const Self,
+        chunk: usize,
+        offset: usize,
+        len: usize,
+    ) -> &'a [T] {
+        debug_assert!(offset <= Self::chunk_capacity_unchecked(chunk));
+        debug_assert!(len <= Self::chunk_capacity_unchecked(chunk) - offset);
+
         let ptr = if mem::size_of::<T>() == 0 {
             NonNull::<T>::dangling().as_ptr()
         } else {
-            // SAFETY: callers only request initialized chunks.
-            unsafe { Self::allocated_chunk_pointer_unchecked(array, chunk).cast::<T>() }
+            // SAFETY: callers only request initialized elements inside an
+            // allocated chunk.
+            unsafe { Self::ptr_at_chunk_offset_unchecked(array, chunk, offset) }
         };
 
-        // SAFETY: the chunk contains `len` initialized elements.
+        // SAFETY: `ptr..ptr + len` names initialized elements within one
+        // contiguous chunk.
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
     unsafe fn chunk_slice_mut_from_raw<'a>(array: *mut Self, chunk: usize) -> &'a mut [T] {
         let len = Self::initialized_len_in_chunk_raw(array, chunk);
+        // SAFETY: callers only request initialized chunks, starting at offset
+        // zero and spanning the initialized prefix of the chunk.
+        unsafe { Self::chunk_slice_range_mut_from_raw(array, chunk, 0, len) }
+    }
+
+    unsafe fn chunk_slice_range_mut_from_raw<'a>(
+        array: *mut Self,
+        chunk: usize,
+        offset: usize,
+        len: usize,
+    ) -> &'a mut [T] {
+        debug_assert!(offset <= Self::chunk_capacity_unchecked(chunk));
+        debug_assert!(len <= Self::chunk_capacity_unchecked(chunk) - offset);
+
         let ptr = if mem::size_of::<T>() == 0 {
             NonNull::<T>::dangling().as_ptr()
         } else {
-            // SAFETY: callers only request initialized chunks.
-            unsafe {
-                Self::allocated_chunk_pointer_unchecked(array.cast_const(), chunk).cast::<T>()
-            }
+            // SAFETY: callers only request initialized elements inside an
+            // allocated chunk.
+            unsafe { Self::ptr_at_chunk_offset_unchecked(array.cast_const(), chunk, offset) }
         };
 
-        // SAFETY: the chunk contains `len` initialized elements and the mutable
-        // chunk iterator yields each chunk at most once.
+        // SAFETY: `ptr..ptr + len` names initialized elements within one
+        // contiguous chunk, and callers guarantee exclusive access to the
+        // selected range for the returned lifetime.
         unsafe { slice::from_raw_parts_mut(ptr, len) }
     }
 
@@ -1372,6 +1402,40 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> Iterator
         let len = self.len();
         (len, Some(len))
     }
+
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut accum = init;
+        let mut index = self.cursor.front;
+        let end = self.cursor.back;
+
+        while index < end {
+            let (chunk, offset) = ExponentialArray::<T, BASE_SHIFT, CHUNKS>::locate(index);
+            let chunk_start =
+                ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_start_unchecked(chunk);
+            let chunk_end = chunk_start
+                .saturating_add(
+                    ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_capacity_unchecked(chunk),
+                )
+                .min(end);
+            let len = chunk_end - index;
+
+            // SAFETY: `index..chunk_end` is contained in the iterator's
+            // initialized remaining range and lies within one chunk.
+            let values = unsafe {
+                ExponentialArray::chunk_slice_range_from_raw(self.array, chunk, offset, len)
+            };
+            for value in values {
+                accum = f(accum, value);
+            }
+
+            index = chunk_end;
+        }
+
+        accum
+    }
 }
 
 impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> DoubleEndedIterator
@@ -1385,6 +1449,38 @@ impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> DoubleEndedIterator
         Some(unsafe {
             &*ExponentialArray::ptr_at_chunk_offset_unchecked(self.array, chunk, offset)
         })
+    }
+
+    fn rfold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut accum = init;
+        let start = self.cursor.front;
+        let mut end = self.cursor.back;
+
+        while start < end {
+            let last = end - 1;
+            let (chunk, _) = ExponentialArray::<T, BASE_SHIFT, CHUNKS>::locate(last);
+            let chunk_start =
+                ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_start_unchecked(chunk).max(start);
+            let offset = chunk_start
+                - ExponentialArray::<T, BASE_SHIFT, CHUNKS>::chunk_start_unchecked(chunk);
+            let len = end - chunk_start;
+
+            // SAFETY: `chunk_start..end` is contained in the iterator's
+            // initialized remaining range and lies within one chunk.
+            let values = unsafe {
+                ExponentialArray::chunk_slice_range_from_raw(self.array, chunk, offset, len)
+            };
+            for value in values.iter().rev() {
+                accum = f(accum, value);
+            }
+
+            end = chunk_start;
+        }
+
+        accum
     }
 }
 

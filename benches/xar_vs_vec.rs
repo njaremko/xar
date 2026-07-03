@@ -1,7 +1,7 @@
 use divan::{black_box, counter::ItemsCount, Bencher};
 use xar::Xar;
 
-const SIZES: &[usize] = &[64, 1_024, 16_384];
+const SIZES: &[usize] = &[64, 1_024, 16_384, 262_144, 1_048_576];
 
 fn main() {
     divan::main();

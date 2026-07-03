@@ -1,3 +1,4 @@
 /.hegel/
 /target/
+/.tmp/
 .DS_Store

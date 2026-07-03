@@ -392,6 +392,48 @@ fn shared_double_ended_iterator_matches_vec_deque(tc: hegel::TestCase) {
 }
 
 #[hegel::test(test_cases = 128)]
+fn shared_iterator_fold_matches_vec_deque_after_partial_consumption(tc: hegel::TestCase) {
+    let values = draw_values(&tc, 300);
+    let operations = tc.draw(gs::vecs(gs::booleans()).max_size(values.len() + 16));
+    let array = values.iter().copied().collect::<PropertyArray<_>>();
+
+    let mut fold_model = VecDeque::from(values.clone());
+    let mut fold_iter = array.iter();
+    for &take_back in &operations {
+        if take_back {
+            assert_eq!(fold_iter.next_back().copied(), fold_model.pop_back());
+        } else {
+            assert_eq!(fold_iter.next().copied(), fold_model.pop_front());
+        }
+    }
+
+    let folded = fold_iter.fold(Vec::new(), |mut seen, value| {
+        seen.push(*value);
+        seen
+    });
+    assert_eq!(folded, fold_model.iter().copied().collect::<Vec<_>>());
+
+    let mut rfold_model = VecDeque::from(values);
+    let mut rfold_iter = array.iter();
+    for &take_back in &operations {
+        if take_back {
+            assert_eq!(rfold_iter.next_back().copied(), rfold_model.pop_back());
+        } else {
+            assert_eq!(rfold_iter.next().copied(), rfold_model.pop_front());
+        }
+    }
+
+    let rfolded = rfold_iter.rfold(Vec::new(), |mut seen, value| {
+        seen.push(*value);
+        seen
+    });
+    assert_eq!(
+        rfolded,
+        rfold_model.iter().rev().copied().collect::<Vec<_>>()
+    );
+}
+
+#[hegel::test(test_cases = 128)]
 fn mutable_double_ended_iterator_matches_vec_deque(tc: hegel::TestCase) {
     let values = draw_values(&tc, 300);
     let operations = tc.draw(gs::vecs(gs::booleans()).max_size(values.len() + 16));
@@ -836,7 +878,7 @@ fn mutable_double_ended_iterator_matches_vec_deque_order() {
                 old_value
             })
             .collect::<Vec<_>>();
-        expected_observed.extend(model.into_iter());
+        expected_observed.extend(model);
         observed.extend(remaining);
     }
 
