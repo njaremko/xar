@@ -28,21 +28,23 @@ for i in 0..10_000 {
 assert_eq!(unsafe { root.as_ref() }, "root");
 ```
 
-Dereferencing a pointer returned by `ptr()` or `push_ptr()` is still `unsafe`.
-The crate guarantees address stability, not aliasing correctness. A pointer must
-not be used after the pointed-to element is removed by `pop`, `truncate`,
-`clear`, or after the array is dropped.
+Dereferencing a pointer returned by `ptr()`, `last_ptr()`, or `push_ptr()` is
+still `unsafe`. The crate guarantees address stability, not aliasing
+correctness. A pointer must not be used after the pointed-to element is removed
+by `pop`, `truncate`, `clear`, a shrinking `resize` / `resize_with`, when it is
+moved out of the source array by `append`, when it is in the tail moved out by
+`split_off`, or after the array is dropped.
 
 ## API shape
 
 The public API follows common Rust container conventions:
 
 - `new`, `with_capacity`, `reserve`, and `try_reserve`
-- `push`, `try_push`, `pop`, `truncate`, and `clear`
-- `get`, `get_mut`, `Index`, and `IndexMut`
-- `iter`, `iter_mut`, `chunks`, `chunks_mut`
+- `push`, `try_push`, `append`, `pop`, `truncate`, `split_off`, `resize`, and `clear`
+- `get`, `get_mut`, `first`, `last`, `Index`, and `IndexMut`
+- `ptr`, `last_ptr`, `extend_from_slice`, `extend_from_within`, `iter`, `iter_mut`, `chunks`, `chunks_mut`
 - `IntoIterator` for owned, shared, and mutable forms
-- common traits: `Default`, `Clone`, `Debug`, `Eq`, `Ord`, `Hash`, `Extend`, and `FromIterator`
+- common traits: `Default`, `Clone`, `Debug`, `Eq`, `Ord`, `Hash`, `Extend`, `From`, and `FromIterator`
 
 `push` returns the appended element's index. Use `push_mut` for an immediate
 mutable reference or `push_ptr` for an immediate stable raw pointer.

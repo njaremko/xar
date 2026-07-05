@@ -64,6 +64,7 @@
 extern crate alloc;
 
 use alloc::alloc::{alloc, dealloc, handle_alloc_error};
+use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cmp::Ordering;
 use core::fmt;
@@ -71,7 +72,7 @@ use core::hash::{Hash, Hasher};
 use core::iter::{Extend, FromIterator, FusedIterator};
 use core::marker::PhantomData;
 use core::mem::{self, MaybeUninit};
-use core::ops::{Index, IndexMut};
+use core::ops::{Bound, Index, IndexMut, RangeBounds};
 use core::ptr::{self, NonNull};
 use core::slice;
 
@@ -125,9 +126,12 @@ pub type Xar<T> = ExponentialArray<T, DEFAULT_BASE_SHIFT, DEFAULT_CHUNKS>;
 /// `reserve`, and `try_reserve` do not move existing elements.
 ///
 /// An element stops being initialized when it is removed by [`pop`](Self::pop),
-/// [`truncate`](Self::truncate), or [`clear`](Self::clear), or when the whole
-/// array is dropped. Any raw pointer to that element must then be treated as
-/// invalid. For zero-sized types, addresses are not meaningful.
+/// [`truncate`](Self::truncate), [`clear`](Self::clear), a shrinking
+/// [`resize`](Self::resize) or [`resize_with`](Self::resize_with), when it is
+/// moved out of the source array by [`append`](Self::append), when it is in the
+/// tail moved out by [`split_off`](Self::split_off), or when the whole array is
+/// dropped. Any raw pointer to that element must then be treated as invalid.
+/// For zero-sized types, addresses are not meaningful.
 ///
 /// # Contiguity
 ///
@@ -332,6 +336,52 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns a shared reference to the first element, or `None` if empty.
+    #[must_use]
+    pub fn first(&self) -> Option<&T> {
+        self.get(0)
+    }
+
+    /// Returns a mutable reference to the first element, or `None` if empty.
+    #[must_use]
+    pub fn first_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(0)
+    }
+
+    /// Returns a shared reference to the last element, or `None` if empty.
+    #[must_use]
+    pub fn last(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.get(self.len - 1)
+        }
+    }
+
+    /// Returns a mutable reference to the last element, or `None` if empty.
+    #[must_use]
+    pub fn last_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.get_mut(self.len - 1)
+        }
+    }
+
+    /// Returns a stable raw pointer to the last element, or `None` if empty.
+    ///
+    /// The pointer remains non-dangling until the element is removed or the
+    /// array is dropped. Dereferencing the pointer is unsafe and must obey
+    /// Rust's aliasing rules.
+    #[must_use]
+    pub fn last_ptr(&self) -> Option<NonNull<T>> {
+        if self.len == 0 {
+            None
+        } else {
+            self.ptr(self.len - 1)
+        }
     }
 
     fn debug_assert_invariants(&self) {
@@ -552,6 +602,100 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         Ok(index)
     }
 
+    /// Appends clones of all elements in `values`.
+    ///
+    /// Existing elements are not moved. If reserving space fails, no elements
+    /// are appended.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested capacity exceeds [`max_capacity`](Self::max_capacity).
+    /// On allocation failure, this uses the global allocation error handler.
+    pub fn extend_from_slice(&mut self, values: &[T])
+    where
+        T: Clone,
+    {
+        self.reserve(values.len());
+        for value in values {
+            self.push(value.clone());
+        }
+    }
+
+    /// Appends clones of the elements in `range` to the end of the array.
+    ///
+    /// Existing elements are not moved. The source range is resolved before any
+    /// new elements are appended, matching [`Vec::extend_from_within`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is out of bounds, if the requested capacity exceeds
+    /// [`max_capacity`](Self::max_capacity), or if cloning an element panics. On
+    /// allocation failure, this uses the global allocation error handler.
+    pub fn extend_from_within<R>(&mut self, range: R)
+    where
+        T: Clone,
+        R: RangeBounds<usize>,
+    {
+        let (start, end) = self.resolve_range_bounds(range);
+        let additional = end - start;
+        if additional == 0 {
+            return;
+        }
+
+        self.reserve(additional);
+        for index in start..end {
+            let value = self[index].clone();
+            self.push(value);
+        }
+    }
+
+    /// Moves all elements from `other` to the end of `self`, leaving `other`
+    /// empty.
+    ///
+    /// Existing elements in `self` are not moved. Raw pointers to elements that
+    /// were in `other` become invalid because those elements are removed from
+    /// `other` before being appended to `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested capacity exceeds [`max_capacity`](Self::max_capacity).
+    /// On allocation failure, this uses the global allocation error handler. If
+    /// reserving space fails, both arrays keep their original elements.
+    pub fn append(&mut self, other: &mut Self) {
+        let count = other.len;
+        if count == 0 {
+            return;
+        }
+
+        self.reserve(count);
+
+        let other_array = other as *mut Self;
+        let mut guard = DropRangeGuard {
+            array: other_array,
+            start: 0,
+            end: count,
+        };
+
+        other.len = 0;
+        other.tail_chunk = 0;
+        other.tail_offset = 0;
+        other.debug_assert_invariants();
+
+        while guard.start < guard.end {
+            let index = guard.start;
+            let (chunk, offset) = Self::locate(index);
+            // SAFETY: `guard.start..guard.end` covers initialized elements
+            // removed from `other`, and this index has not been read yet.
+            let value = unsafe {
+                Self::ptr_at_chunk_offset_unchecked(other_array.cast_const(), chunk, offset).read()
+            };
+            guard.start = index + 1;
+            self.push(value);
+        }
+
+        other.debug_assert_invariants();
+    }
+
     fn reserve_tail_slot(&mut self) -> Result<(usize, usize, usize), TryReserveError> {
         let index = self.len;
         self.try_reserve(1)?;
@@ -611,6 +755,118 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         // has already been shortened so a panic while dropping cannot drop the
         // same elements again.
         unsafe { self.drop_range_unchecked(new_len, old_len) };
+    }
+
+    /// Resizes the array to `new_len`.
+    ///
+    /// If `new_len` is less than the current length, the array is truncated. If
+    /// it is greater, clones of `value` are appended until the requested length
+    /// is reached. Existing elements that remain in the array are not moved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested capacity exceeds [`max_capacity`](Self::max_capacity),
+    /// or if cloning `value` panics. On allocation failure, this uses the global
+    /// allocation error handler.
+    pub fn resize(&mut self, new_len: usize, value: T)
+    where
+        T: Clone,
+    {
+        let len = self.len;
+        if new_len <= len {
+            self.truncate(new_len);
+            return;
+        }
+
+        let additional = new_len - len;
+        self.reserve(additional);
+
+        for _ in 1..additional {
+            self.push(value.clone());
+        }
+        self.push(value);
+    }
+
+    /// Resizes the array to `new_len` using `make_value` for appended elements.
+    ///
+    /// If `new_len` is less than the current length, the array is truncated and
+    /// `make_value` is not called. If it is greater, `make_value` is called once
+    /// for each appended element. Existing elements that remain in the array are
+    /// not moved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested capacity exceeds [`max_capacity`](Self::max_capacity),
+    /// or if `make_value` panics. On allocation failure, this uses the global
+    /// allocation error handler.
+    pub fn resize_with<F>(&mut self, new_len: usize, mut make_value: F)
+    where
+        F: FnMut() -> T,
+    {
+        let len = self.len;
+        if new_len <= len {
+            self.truncate(new_len);
+            return;
+        }
+
+        let additional = new_len - len;
+        self.reserve(additional);
+
+        for _ in 0..additional {
+            self.push(make_value());
+        }
+    }
+
+    /// Splits the array into two at `at`.
+    ///
+    /// `self` keeps `0..at`, and the returned array contains the old
+    /// `at..len` tail in order. Existing elements retained by `self` are not
+    /// moved. Raw pointers to elements in the split-off tail become invalid
+    /// because those elements are removed from `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`, or if allocating the returned array fails. On
+    /// allocation failure, this uses the global allocation error handler.
+    #[must_use]
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let len = self.len;
+        assert!(
+            at <= len,
+            "split_off index {at} out of bounds for ExponentialArray with len {len}"
+        );
+
+        let tail_len = len - at;
+        let mut tail = Self::with_capacity(tail_len);
+        if tail_len == 0 {
+            return tail;
+        }
+
+        let self_array = self as *mut Self;
+        let mut guard = DropRangeGuard {
+            array: self_array,
+            start: at,
+            end: len,
+        };
+        let (tail_chunk, tail_offset) = Self::end_position(at);
+        self.len = at;
+        self.tail_chunk = tail_chunk;
+        self.tail_offset = tail_offset;
+        self.debug_assert_invariants();
+
+        while guard.start < guard.end {
+            let index = guard.start;
+            let (chunk, offset) = Self::locate(index);
+            // SAFETY: `guard.start..guard.end` covers initialized elements
+            // removed from `self`, and this index has not been read yet.
+            let value = unsafe {
+                Self::ptr_at_chunk_offset_unchecked(self_array.cast_const(), chunk, offset).read()
+            };
+            guard.start = index + 1;
+            tail.push(value);
+        }
+
+        tail
     }
 
     /// Removes all elements.
@@ -740,6 +996,36 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         } else {
             Self::locate(self.len - 1).0 + 1
         }
+    }
+
+    fn resolve_range_bounds<R>(&self, range: R) -> (usize, usize)
+    where
+        R: RangeBounds<usize>,
+    {
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start
+                .checked_add(1)
+                .expect("range start index overflows usize"),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end.checked_add(1).expect("range end index overflows usize"),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => self.len,
+        };
+
+        assert!(
+            start <= end,
+            "range start index {start} exceeds range end index {end}"
+        );
+        assert!(
+            end <= self.len,
+            "range end index {end} out of bounds for ExponentialArray with len {}",
+            self.len
+        );
+
+        (start, end)
     }
 
     fn initial_front_remaining(len: usize) -> usize {
@@ -1073,10 +1359,10 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop
             return;
         }
 
-        // SAFETY: the guard is created only by `drop_range_unchecked` while the
-        // range names initialized elements. If this runs during unwinding, the
-        // current chunk has already been handed to slice drop glue and
-        // `start..end` covers only later chunks.
+        // SAFETY: guards are created only for initialized ranges whose already
+        // consumed prefix is excluded by `start`. During unwinding, `start..end`
+        // names only elements that have not been moved out or handed to slice
+        // drop glue.
         unsafe { (*self.array).drop_range_unchecked(self.start, self.end) };
     }
 }
@@ -1137,11 +1423,100 @@ impl<T: fmt::Debug, const BASE_SHIFT: usize, const CHUNKS: usize> fmt::Debug
     }
 }
 
-impl<T: PartialEq, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq
-    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+fn partial_cmp_sequences<'a, 'b, T, U, I, J>(mut left: I, mut right: J) -> Option<Ordering>
+where
+    T: PartialOrd<U> + 'a,
+    U: 'b,
+    I: Iterator<Item = &'a T>,
+    J: Iterator<Item = &'b U>,
 {
-    fn eq(&self, other: &Self) -> bool {
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left_value), Some(right_value)) => match left_value.partial_cmp(right_value)? {
+                Ordering::Equal => {}
+                ordering => return Some(ordering),
+            },
+            (Some(_), None) => return Some(Ordering::Greater),
+            (None, Some(_)) => return Some(Ordering::Less),
+            (None, None) => return Some(Ordering::Equal),
+        }
+    }
+}
+
+impl<
+        T,
+        U,
+        const BASE_SHIFT: usize,
+        const CHUNKS: usize,
+        const OTHER_BASE_SHIFT: usize,
+        const OTHER_CHUNKS: usize,
+    > PartialEq<ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>) -> bool {
         self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<[U]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U]) -> bool {
+        self.len == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<&[U]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&[U]) -> bool {
+        <Self as PartialEq<[U]>>::eq(self, *other)
+    }
+}
+
+impl<T, U, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<[U; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U; N]) -> bool {
+        <Self as PartialEq<[U]>>::eq(self, &other[..])
+    }
+}
+
+impl<T, U, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<&[U; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&[U; N]) -> bool {
+        <Self as PartialEq<[U]>>::eq(self, &other[..])
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<Vec<U>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &Vec<U>) -> bool {
+        <Self as PartialEq<[U]>>::eq(self, other.as_slice())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialEq<&Vec<U>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&Vec<U>) -> bool {
+        <Self as PartialEq<[U]>>::eq(self, other.as_slice())
     }
 }
 
@@ -1150,11 +1525,83 @@ impl<T: Eq, const BASE_SHIFT: usize, const CHUNKS: usize> Eq
 {
 }
 
-impl<T: PartialOrd, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd
+impl<
+        T,
+        U,
+        const BASE_SHIFT: usize,
+        const CHUNKS: usize,
+        const OTHER_BASE_SHIFT: usize,
+        const OTHER_CHUNKS: usize,
+    > PartialOrd<ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>>
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
 {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.iter().partial_cmp(other.iter())
+    fn partial_cmp(
+        &self,
+        other: &ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>,
+    ) -> Option<Ordering> {
+        partial_cmp_sequences(self.iter(), other.iter())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<[U]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &[U]) -> Option<Ordering> {
+        partial_cmp_sequences(self.iter(), other.iter())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<&[U]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &&[U]) -> Option<Ordering> {
+        <Self as PartialOrd<[U]>>::partial_cmp(self, *other)
+    }
+}
+
+impl<T, U, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<[U; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &[U; N]) -> Option<Ordering> {
+        <Self as PartialOrd<[U]>>::partial_cmp(self, &other[..])
+    }
+}
+
+impl<T, U, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<&[U; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &&[U; N]) -> Option<Ordering> {
+        <Self as PartialOrd<[U]>>::partial_cmp(self, &other[..])
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<Vec<U>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &Vec<U>) -> Option<Ordering> {
+        <Self as PartialOrd<[U]>>::partial_cmp(self, other.as_slice())
+    }
+}
+
+impl<T, U, const BASE_SHIFT: usize, const CHUNKS: usize> PartialOrd<&Vec<U>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: PartialOrd<U>,
+{
+    fn partial_cmp(&self, other: &&Vec<U>) -> Option<Ordering> {
+        <Self as PartialOrd<[U]>>::partial_cmp(self, other.as_slice())
     }
 }
 
@@ -1196,6 +1643,19 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Extend<T>
     }
 }
 
+impl<'a, T, const BASE_SHIFT: usize, const CHUNKS: usize> Extend<&'a T>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: Copy + 'a,
+{
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = &'a T>,
+    {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> FromIterator<T>
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
 {
@@ -1218,6 +1678,68 @@ impl<T, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> From<[T; N
         let mut array = Self::with_capacity(N);
         array.extend(values);
         array
+    }
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<Vec<T>>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+{
+    fn from(values: Vec<T>) -> Self {
+        let mut array = Self::with_capacity(values.len());
+        array.extend(values);
+        array
+    }
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<ExponentialArray<T, BASE_SHIFT, CHUNKS>>
+    for Vec<T>
+{
+    fn from(array: ExponentialArray<T, BASE_SHIFT, CHUNKS>) -> Self {
+        let mut values = Vec::with_capacity(array.len());
+        values.extend(array);
+        values
+    }
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<&[T]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: Clone,
+{
+    fn from(values: &[T]) -> Self {
+        let mut array = Self::with_capacity(values.len());
+        array.extend_from_slice(values);
+        array
+    }
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<&mut [T]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: Clone,
+{
+    fn from(values: &mut [T]) -> Self {
+        Self::from(&values[..])
+    }
+}
+
+impl<T, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> From<&[T; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: Clone,
+{
+    fn from(values: &[T; N]) -> Self {
+        Self::from(&values[..])
+    }
+}
+
+impl<T, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> From<&mut [T; N]>
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+where
+    T: Clone,
+{
+    fn from(values: &mut [T; N]) -> Self {
+        Self::from(&values[..])
     }
 }
 

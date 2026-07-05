@@ -1063,6 +1063,230 @@ fn supports_zero_sized_types() {
 }
 
 #[test]
+fn front_and_back_helpers_match_vec_observations() {
+    let mut xs = PropertyArray::<i32>::new();
+
+    assert_eq!(xs.first(), None);
+    assert_eq!(xs.first_mut(), None);
+    assert_eq!(xs.last(), None);
+    assert_eq!(xs.last_mut(), None);
+    assert_eq!(xs.last_ptr(), None);
+
+    xs.extend([1, 2, 3, 4]);
+    assert_eq!(xs.first(), Some(&1));
+    assert_eq!(xs.last(), Some(&4));
+
+    *xs.first_mut().unwrap() = 10;
+    *xs.last_mut().unwrap() = 40;
+
+    let last_pointer = xs.last_ptr().unwrap();
+    assert_eq!(last_pointer, xs.ptr(xs.len() - 1).unwrap());
+    assert_eq!(unsafe { *last_pointer.as_ptr() }, 40);
+    assert_i32_array_matches_vec(&xs, &[10, 2, 3, 40]);
+}
+
+#[test]
+fn append_moves_source_sequence_without_moving_existing_destination() {
+    let mut dst = (0..8).collect::<PropertyArray<_>>();
+    let stable_prefix = (0..dst.len())
+        .map(|index| (index, dst.ptr(index).unwrap(), dst[index]))
+        .collect::<Vec<_>>();
+    let mut src = (100..108).collect::<PropertyArray<_>>();
+    let expected = (0..8).chain(100..108).collect::<Vec<_>>();
+
+    dst.append(&mut src);
+
+    assert!(src.is_empty());
+    assert_i32_array_matches_vec(&dst, &expected);
+    for (index, pointer, value) in stable_prefix {
+        assert_eq!(dst.ptr(index).unwrap(), pointer);
+        assert_eq!(unsafe { *pointer.as_ptr() }, value);
+    }
+}
+
+#[test]
+fn append_capacity_failure_leaves_both_sequences_unchanged() {
+    let mut dst = ExponentialArray::<u8, 0, 2>::from([1, 2]);
+    let mut src = ExponentialArray::<u8, 0, 2>::from([3]);
+
+    let result = catch_unwind(AssertUnwindSafe(|| dst.append(&mut src)));
+
+    assert!(result.is_err());
+    assert_eq!(dst.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(src.iter().copied().collect::<Vec<_>>(), vec![3]);
+}
+
+#[test]
+fn resize_and_resize_with_match_vec_tail_behavior() {
+    let mut xs = PropertyArray::from([1, 2, 3, 4]);
+    let first_pointer = xs.ptr(0).unwrap();
+
+    xs.resize(2, 9);
+    assert_i32_array_matches_vec(&xs, &[1, 2]);
+    assert_eq!(xs.ptr(0).unwrap(), first_pointer);
+
+    xs.resize(5, 7);
+    assert_i32_array_matches_vec(&xs, &[1, 2, 7, 7, 7]);
+    assert_eq!(xs.ptr(0).unwrap(), first_pointer);
+
+    let mut next_value = 10;
+    xs.resize_with(8, || {
+        let value = next_value;
+        next_value += 1;
+        value
+    });
+    assert_i32_array_matches_vec(&xs, &[1, 2, 7, 7, 7, 10, 11, 12]);
+    assert_eq!(xs.ptr(0).unwrap(), first_pointer);
+
+    xs.resize_with(3, || panic!("truncate must not call the generator"));
+    assert_i32_array_matches_vec(&xs, &[1, 2, 7]);
+    assert_eq!(xs.ptr(0).unwrap(), first_pointer);
+}
+
+#[test]
+fn resize_capacity_failure_preserves_existing_sequence() {
+    let mut resized = ExponentialArray::<i32, 0, 2>::from([1, 2]);
+    let resize_result = catch_unwind(AssertUnwindSafe(|| resized.resize(3, 9)));
+    assert!(resize_result.is_err());
+    assert_eq!(resized.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+    let mut resized_with = ExponentialArray::<i32, 0, 2>::from([1, 2]);
+    let calls = Cell::new(0);
+    let resize_with_result = catch_unwind(AssertUnwindSafe(|| {
+        resized_with.resize_with(3, || {
+            calls.set(calls.get() + 1);
+            9
+        })
+    }));
+
+    assert!(resize_with_result.is_err());
+    assert_eq!(calls.get(), 0);
+    assert_eq!(resized_with.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+}
+
+#[test]
+fn split_off_moves_tail_without_moving_retained_prefix() {
+    let mut xs = (0..10).collect::<PropertyArray<_>>();
+    let stable_prefix = (0..4)
+        .map(|index| (index, xs.ptr(index).unwrap(), xs[index]))
+        .collect::<Vec<_>>();
+
+    let tail = xs.split_off(4);
+
+    assert_i32_array_matches_vec(&xs, &[0, 1, 2, 3]);
+    assert_i32_array_matches_vec(&tail, &[4, 5, 6, 7, 8, 9]);
+    for (index, pointer, value) in stable_prefix {
+        assert_eq!(xs.ptr(index).unwrap(), pointer);
+        assert_eq!(unsafe { *pointer.as_ptr() }, value);
+    }
+
+    let empty_tail = xs.split_off(xs.len());
+    assert!(empty_tail.is_empty());
+    assert_i32_array_matches_vec(&xs, &[0, 1, 2, 3]);
+
+    let all = xs.split_off(0);
+    assert!(xs.is_empty());
+    assert_i32_array_matches_vec(&all, &[0, 1, 2, 3]);
+}
+
+#[test]
+fn split_off_out_of_bounds_preserves_sequence() {
+    let mut xs = PropertyArray::from([1, 2, 3]);
+    let result = catch_unwind(AssertUnwindSafe(|| xs.split_off(4)));
+
+    assert!(result.is_err());
+    assert_i32_array_matches_vec(&xs, &[1, 2, 3]);
+}
+
+#[test]
+fn extend_from_within_matches_vec_and_preserves_existing_addresses() {
+    let mut xs = PropertyArray::from([0, 1, 2, 3, 4]);
+    let stable_prefix = (0..xs.len())
+        .map(|index| (index, xs.ptr(index).unwrap(), xs[index]))
+        .collect::<Vec<_>>();
+    let mut model = vec![0, 1, 2, 3, 4];
+
+    xs.extend_from_within(1..4);
+    model.extend_from_within(1..4);
+    assert_i32_array_matches_vec(&xs, &model);
+
+    xs.extend_from_within(..=2);
+    model.extend_from_within(..=2);
+    assert_i32_array_matches_vec(&xs, &model);
+
+    for (index, pointer, value) in stable_prefix {
+        assert_eq!(xs.ptr(index).unwrap(), pointer);
+        assert_eq!(unsafe { *pointer.as_ptr() }, value);
+    }
+}
+
+#[test]
+fn extend_from_within_invalid_range_preserves_sequence() {
+    let mut xs = PropertyArray::from([1, 2, 3]);
+    let reversed_start = 2;
+    let reversed_end = 1;
+    let reversed = catch_unwind(AssertUnwindSafe(|| {
+        xs.extend_from_within(reversed_start..reversed_end)
+    }));
+    assert!(reversed.is_err());
+    assert_i32_array_matches_vec(&xs, &[1, 2, 3]);
+
+    let out_of_bounds = catch_unwind(AssertUnwindSafe(|| xs.extend_from_within(1..4)));
+    assert!(out_of_bounds.is_err());
+    assert_i32_array_matches_vec(&xs, &[1, 2, 3]);
+}
+
+#[test]
+fn slice_array_and_vec_conversions_preserve_sequence() {
+    let source = vec![String::from("a"), String::from("b")];
+    let from_slice = PropertyArray::<String>::from(source.as_slice());
+    assert_eq!(from_slice.iter().cloned().collect::<Vec<_>>(), source);
+
+    let mut mutable_slice_values = [String::from("c"), String::from("d")];
+    let from_mut_slice = PropertyArray::<String>::from(&mut mutable_slice_values[..]);
+    assert_eq!(
+        from_mut_slice.iter().cloned().collect::<Vec<_>>(),
+        vec![String::from("c"), String::from("d")]
+    );
+
+    let from_array_ref = PropertyArray::<String>::from(&[String::from("e"), String::from("f")]);
+    assert_eq!(
+        from_array_ref.iter().cloned().collect::<Vec<_>>(),
+        vec![String::from("e"), String::from("f")]
+    );
+
+    let mut mutable_array_values = [String::from("g"), String::from("h")];
+    let from_mut_array = PropertyArray::<String>::from(&mut mutable_array_values);
+    assert_eq!(
+        from_mut_array.iter().cloned().collect::<Vec<_>>(),
+        vec![String::from("g"), String::from("h")]
+    );
+
+    let from_vec = PropertyArray::<String>::from(vec![String::from("i"), String::from("j")]);
+    let back_to_vec: Vec<_> = from_vec.into();
+    assert_eq!(back_to_vec, vec![String::from("i"), String::from("j")]);
+}
+
+#[test]
+fn comparison_and_extend_traits_accept_common_sequence_inputs() {
+    let mut xs = PropertyArray::<i32>::new();
+    xs.extend(&[1, 2, 3]);
+
+    let same_array = [1, 2, 3];
+    let same_slice: &[i32] = &same_array;
+    let same_vec = vec![1, 2, 3];
+    let larger_vec = vec![1, 2, 4];
+    let same_other_config = ExponentialArray::<_, 1, 8>::from([1, 2, 3]);
+
+    assert_eq!(xs, same_array);
+    assert_eq!(xs, same_slice);
+    assert_eq!(xs, same_vec);
+    assert_eq!(xs, same_other_config);
+    assert!(xs <= same_slice);
+    assert!(xs < larger_vec);
+}
+
+#[test]
 fn capacity_errors_return_original_value() {
     let mut xs = ExponentialArray::<u8, 0, 2>::new();
     assert_eq!(ExponentialArray::<u8, 0, 2>::max_capacity(), 2);
@@ -1087,6 +1311,10 @@ fn capacity_errors_return_original_value() {
 fn from_array_and_extend() {
     let mut xs = ExponentialArray::<_, 1, 8>::from([1, 2, 3]);
     xs.extend([4, 5, 6]);
+    xs.extend(&[7, 8, 9]);
 
-    assert_eq!(xs.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        xs.into_iter().collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+    );
 }
