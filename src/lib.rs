@@ -616,9 +616,9 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         T: Clone,
     {
         self.reserve(values.len());
-        for value in values {
-            self.push(value.clone());
-        }
+        // SAFETY: the reservation above guarantees enough uninitialized tail
+        // slots for all cloned values.
+        unsafe { self.clone_from_ptr_to_tail_reserved(values.as_ptr(), values.len()) };
     }
 
     /// Appends clones of the elements in `range` to the end of the array.
@@ -643,10 +643,10 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         }
 
         self.reserve(additional);
-        for index in start..end {
-            let value = self[index].clone();
-            self.push(value);
-        }
+        // SAFETY: `start..end` was resolved against the old initialized length,
+        // and reservation above guarantees enough disjoint tail slots for the
+        // cloned values.
+        unsafe { self.clone_array_range_to_tail_reserved(start, end) };
     }
 
     /// Moves all elements from `other` to the end of `self`, leaving `other`
@@ -670,30 +670,288 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         self.reserve(count);
 
         let other_array = other as *mut Self;
-        let mut guard = DropRangeGuard {
-            array: other_array,
-            start: 0,
-            end: count,
-        };
-
+        // SAFETY: `other_array` owns initialized elements in `0..count`, and
+        // reservation above guarantees disjoint uninitialized tail slots in
+        // `self`. After the non-panicking bulk moves, `other` is marked empty so
+        // those moved values are not dropped twice.
+        unsafe { self.move_array_range_to_tail_unchecked(other_array.cast_const(), 0, count) };
         other.len = 0;
         other.tail_chunk = 0;
         other.tail_offset = 0;
         other.debug_assert_invariants();
+    }
 
-        while guard.start < guard.end {
-            let index = guard.start;
+    unsafe fn move_array_range_to_tail_unchecked(
+        &mut self,
+        source: *const Self,
+        start: usize,
+        end: usize,
+    ) {
+        debug_assert!(start <= end);
+
+        let mut index = start;
+        while index < end {
             let (chunk, offset) = Self::locate(index);
-            // SAFETY: `guard.start..guard.end` covers initialized elements
-            // removed from `other`, and this index has not been read yet.
-            let value = unsafe {
-                Self::ptr_at_chunk_offset_unchecked(other_array.cast_const(), chunk, offset).read()
-            };
-            guard.start = index + 1;
-            self.push(value);
+            let chunk_end = Self::chunk_start_unchecked(chunk)
+                .saturating_add(Self::chunk_capacity_unchecked(chunk))
+                .min(end);
+            let count = chunk_end - index;
+            // SAFETY: caller guarantees `source[index..end]` is initialized;
+            // this subrange lies in one allocated chunk.
+            let source_ptr = unsafe { Self::ptr_at_chunk_offset_unchecked(source, chunk, offset) };
+            // SAFETY: caller guarantees enough reserved tail capacity and that
+            // source and destination ranges do not overlap.
+            unsafe { self.move_from_ptr_to_tail_unchecked(source_ptr, count) };
+            index = chunk_end;
+        }
+    }
+
+    unsafe fn move_array_range_to_ptr_unchecked(
+        source: *const Self,
+        start: usize,
+        end: usize,
+        mut target: *mut T,
+    ) {
+        debug_assert!(start <= end);
+
+        let mut index = start;
+        while index < end {
+            let (chunk, offset) = Self::locate(index);
+            let chunk_end = Self::chunk_start_unchecked(chunk)
+                .saturating_add(Self::chunk_capacity_unchecked(chunk))
+                .min(end);
+            let count = chunk_end - index;
+            // SAFETY: caller guarantees `source[index..end]` is initialized;
+            // this subrange lies in one allocated chunk.
+            let source_ptr = unsafe { Self::ptr_at_chunk_offset_unchecked(source, chunk, offset) };
+            if mem::size_of::<T>() != 0 {
+                // SAFETY: caller guarantees `target..target + count` is
+                // uninitialized writable storage and does not overlap source.
+                unsafe { ptr::copy_nonoverlapping(source_ptr, target, count) };
+                // SAFETY: the destination range just written has `count`
+                // elements.
+                target = unsafe { target.add(count) };
+            }
+            index = chunk_end;
+        }
+    }
+
+    unsafe fn move_from_ptr_to_tail_unchecked(&mut self, mut source: *const T, mut count: usize) {
+        debug_assert!(self.len.checked_add(count).is_some());
+        debug_assert!(self.len + count <= self.capacity);
+
+        if count == 0 {
+            return;
         }
 
-        other.debug_assert_invariants();
+        if mem::size_of::<T>() == 0 {
+            self.advance_tail_after_bulk_write(count);
+            return;
+        }
+
+        while count != 0 {
+            debug_assert!(self.tail_chunk < CHUNKS);
+            let chunk_capacity = Self::chunk_capacity_unchecked(self.tail_chunk);
+            let chunk_remaining = chunk_capacity - self.tail_offset;
+            let write_count = count.min(chunk_remaining);
+            // SAFETY: caller guarantees the tail range is reserved and
+            // uninitialized; this subrange lies in one allocated chunk.
+            let target = unsafe {
+                Self::ptr_at_chunk_offset_unchecked(self, self.tail_chunk, self.tail_offset)
+            };
+            // SAFETY: caller guarantees source and destination are initialized
+            // and uninitialized respectively, and do not overlap.
+            unsafe { ptr::copy_nonoverlapping(source, target, write_count) };
+            self.len += write_count;
+            self.tail_offset += write_count;
+            if self.tail_offset == chunk_capacity {
+                self.tail_chunk += 1;
+                self.tail_offset = 0;
+            }
+            // SAFETY: the just-moved source subrange had `write_count`
+            // elements.
+            source = unsafe { source.add(write_count) };
+            count -= write_count;
+        }
+    }
+
+    unsafe fn clone_array_range_to_tail_reserved(&mut self, start: usize, end: usize)
+    where
+        T: Clone,
+    {
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.len);
+
+        let array = self as *const Self;
+        let mut index = start;
+        while index < end {
+            let (chunk, offset) = Self::locate(index);
+            let chunk_end = Self::chunk_start_unchecked(chunk)
+                .saturating_add(Self::chunk_capacity_unchecked(chunk))
+                .min(end);
+            let count = chunk_end - index;
+            // SAFETY: `start..end` is initialized and this subrange lies in one
+            // allocated chunk. The destination tail is disjoint because the
+            // range was resolved before appending.
+            let source = unsafe { Self::ptr_at_chunk_offset_unchecked(array, chunk, offset) };
+            // SAFETY: caller reserved enough tail capacity.
+            unsafe { self.clone_from_ptr_to_tail_reserved(source, count) };
+            index = chunk_end;
+        }
+    }
+
+    unsafe fn clone_from_ptr_to_tail_reserved(&mut self, mut source: *const T, mut count: usize)
+    where
+        T: Clone,
+    {
+        debug_assert!(self.len.checked_add(count).is_some());
+        debug_assert!(self.len + count <= self.capacity);
+
+        if count == 0 {
+            return;
+        }
+
+        let mut guard = TailInitGuard::new(self);
+        let mut tail_chunk = self.tail_chunk;
+        let mut tail_offset = self.tail_offset;
+        while count != 0 {
+            debug_assert!(tail_chunk < CHUNKS);
+            let chunk_capacity = Self::chunk_capacity_unchecked(tail_chunk);
+            let chunk_remaining = chunk_capacity - tail_offset;
+            let write_count = count.min(chunk_remaining);
+            // SAFETY: caller reserved the tail slots, and this subrange lies in
+            // one allocated chunk.
+            let target =
+                unsafe { Self::ptr_at_chunk_offset_unchecked(self, tail_chunk, tail_offset) };
+
+            let mut offset = 0usize;
+            while offset < write_count {
+                // SAFETY: caller guarantees `source..source + count` names
+                // initialized elements. It may point inside `self`, but never
+                // into the reserved tail range currently being written.
+                let value = unsafe { (&*source.add(offset)).clone() };
+                // SAFETY: `target + offset` is an uninitialized reserved slot.
+                unsafe { target.add(offset).write(value) };
+                guard.initialized += 1;
+                offset += 1;
+            }
+
+            tail_offset += write_count;
+            if tail_offset == chunk_capacity {
+                tail_chunk += 1;
+                tail_offset = 0;
+            }
+            // SAFETY: the source subrange just cloned had `write_count`
+            // elements.
+            source = unsafe { source.add(write_count) };
+            count -= write_count;
+        }
+        guard.commit();
+    }
+
+    unsafe fn fill_tail_reserved_with<F>(&mut self, mut count: usize, mut make_value: F)
+    where
+        F: FnMut() -> T,
+    {
+        debug_assert!(self.len.checked_add(count).is_some());
+        debug_assert!(self.len + count <= self.capacity);
+
+        if count == 0 {
+            return;
+        }
+
+        let mut guard = TailInitGuard::new(self);
+        let mut tail_chunk = self.tail_chunk;
+        let mut tail_offset = self.tail_offset;
+        while count != 0 {
+            debug_assert!(tail_chunk < CHUNKS);
+            let chunk_capacity = Self::chunk_capacity_unchecked(tail_chunk);
+            let chunk_remaining = chunk_capacity - tail_offset;
+            let write_count = count.min(chunk_remaining);
+            // SAFETY: caller reserved the tail slots, and this subrange lies in
+            // one allocated chunk.
+            let target =
+                unsafe { Self::ptr_at_chunk_offset_unchecked(self, tail_chunk, tail_offset) };
+
+            let mut offset = 0usize;
+            while offset < write_count {
+                let value = make_value();
+                // SAFETY: `target + offset` is an uninitialized reserved slot.
+                unsafe { target.add(offset).write(value) };
+                guard.initialized += 1;
+                offset += 1;
+            }
+
+            tail_offset += write_count;
+            if tail_offset == chunk_capacity {
+                tail_chunk += 1;
+                tail_offset = 0;
+            }
+            count -= write_count;
+        }
+        guard.commit();
+    }
+
+    unsafe fn copy_refs_to_tail_reserved<'a, I>(&mut self, iterator: &mut I, mut count: usize)
+    where
+        T: Copy + 'a,
+        I: Iterator<Item = &'a T>,
+    {
+        debug_assert!(self.len.checked_add(count).is_some());
+        debug_assert!(self.len + count <= self.capacity);
+
+        if count == 0 {
+            return;
+        }
+
+        let mut guard = TailInitGuard::new(self);
+        let mut tail_chunk = self.tail_chunk;
+        let mut tail_offset = self.tail_offset;
+        while count != 0 {
+            debug_assert!(tail_chunk < CHUNKS);
+            let chunk_capacity = Self::chunk_capacity_unchecked(tail_chunk);
+            let chunk_remaining = chunk_capacity - tail_offset;
+            let write_count = count.min(chunk_remaining);
+            // SAFETY: caller reserved the tail slots, and this subrange lies in
+            // one allocated chunk.
+            let target =
+                unsafe { Self::ptr_at_chunk_offset_unchecked(self, tail_chunk, tail_offset) };
+
+            let mut offset = 0usize;
+            while offset < write_count {
+                let Some(value) = iterator.next() else {
+                    guard.commit();
+                    return;
+                };
+                // SAFETY: `target + offset` is an uninitialized reserved slot.
+                unsafe { target.add(offset).write(*value) };
+                guard.initialized += 1;
+                offset += 1;
+            }
+
+            tail_offset += write_count;
+            if tail_offset == chunk_capacity {
+                tail_chunk += 1;
+                tail_offset = 0;
+            }
+            count -= write_count;
+        }
+        guard.commit();
+    }
+
+    fn advance_tail_after_bulk_write(&mut self, count: usize) {
+        debug_assert!(self.len.checked_add(count).is_some());
+        debug_assert!(self.len + count <= self.capacity);
+
+        if count == 0 {
+            return;
+        }
+
+        self.len += count;
+        let (tail_chunk, tail_offset) = Self::end_position(self.len);
+        self.tail_chunk = tail_chunk;
+        self.tail_offset = tail_offset;
+        self.debug_assert_invariants();
     }
 
     fn reserve_tail_slot(&mut self) -> Result<(usize, usize, usize), TryReserveError> {
@@ -781,10 +1039,19 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         let additional = new_len - len;
         self.reserve(additional);
 
-        for _ in 1..additional {
-            self.push(value.clone());
+        if additional == 1 {
+            self.push(value);
+            return;
         }
-        self.push(value);
+
+        // SAFETY: the reservation above guarantees enough uninitialized tail
+        // slots for all appended clones and the final moved value.
+        unsafe {
+            let value_ptr = &value as *const T;
+            self.fill_tail_reserved_with(additional - 1, || (&*value_ptr).clone());
+            self.move_from_ptr_to_tail_unchecked(value_ptr, 1);
+        }
+        mem::forget(value);
     }
 
     /// Resizes the array to `new_len` using `make_value` for appended elements.
@@ -799,7 +1066,7 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
     /// Panics if the requested capacity exceeds [`max_capacity`](Self::max_capacity),
     /// or if `make_value` panics. On allocation failure, this uses the global
     /// allocation error handler.
-    pub fn resize_with<F>(&mut self, new_len: usize, mut make_value: F)
+    pub fn resize_with<F>(&mut self, new_len: usize, make_value: F)
     where
         F: FnMut() -> T,
     {
@@ -812,9 +1079,9 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         let additional = new_len - len;
         self.reserve(additional);
 
-        for _ in 0..additional {
-            self.push(make_value());
-        }
+        // SAFETY: the reservation above guarantees enough uninitialized tail
+        // slots for all generated values.
+        unsafe { self.fill_tail_reserved_with(additional, make_value) };
     }
 
     /// Splits the array into two at `at`.
@@ -843,28 +1110,15 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> ExponentialArray<T, BASE_S
         }
 
         let self_array = self as *mut Self;
-        let mut guard = DropRangeGuard {
-            array: self_array,
-            start: at,
-            end: len,
-        };
+        // SAFETY: `self_array[at..len]` is initialized, `tail` has enough
+        // reserved disjoint storage, and the non-panicking bulk move completes
+        // before `self` is shortened so the moved values are not dropped twice.
+        unsafe { tail.move_array_range_to_tail_unchecked(self_array.cast_const(), at, len) };
         let (tail_chunk, tail_offset) = Self::end_position(at);
         self.len = at;
         self.tail_chunk = tail_chunk;
         self.tail_offset = tail_offset;
         self.debug_assert_invariants();
-
-        while guard.start < guard.end {
-            let index = guard.start;
-            let (chunk, offset) = Self::locate(index);
-            // SAFETY: `guard.start..guard.end` covers initialized elements
-            // removed from `self`, and this index has not been read yet.
-            let value = unsafe {
-                Self::ptr_at_chunk_offset_unchecked(self_array.cast_const(), chunk, offset).read()
-            };
-            guard.start = index + 1;
-            tail.push(value);
-        }
 
         tail
     }
@@ -1367,6 +1621,44 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop
     }
 }
 
+struct TailInitGuard<T, const BASE_SHIFT: usize, const CHUNKS: usize> {
+    array: *mut ExponentialArray<T, BASE_SHIFT, CHUNKS>,
+    initialized: usize,
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> TailInitGuard<T, BASE_SHIFT, CHUNKS> {
+    fn new(array: &mut ExponentialArray<T, BASE_SHIFT, CHUNKS>) -> Self {
+        Self {
+            array,
+            initialized: 0,
+        }
+    }
+
+    fn commit(mut self) {
+        if self.initialized != 0 {
+            // SAFETY: `initialized` counts reserved tail slots this guard has
+            // fully initialized and that are not yet included in `len`.
+            unsafe { (*self.array).advance_tail_after_bulk_write(self.initialized) };
+            self.initialized = 0;
+        }
+    }
+}
+
+impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Drop
+    for TailInitGuard<T, BASE_SHIFT, CHUNKS>
+{
+    fn drop(&mut self) {
+        if self.initialized == 0 {
+            return;
+        }
+
+        // SAFETY: `initialized` counts reserved tail slots that have been fully
+        // initialized before a clone/generator panic. Advancing `len` lets the
+        // array's normal drop path destroy them exactly once.
+        unsafe { (*self.array).advance_tail_after_bulk_write(self.initialized) };
+    }
+}
+
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> Default
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
 {
@@ -1423,22 +1715,129 @@ impl<T: fmt::Debug, const BASE_SHIFT: usize, const CHUNKS: usize> fmt::Debug
     }
 }
 
-fn partial_cmp_sequences<'a, 'b, T, U, I, J>(mut left: I, mut right: J) -> Option<Ordering>
+fn next_non_empty_chunk<'a, T, I>(chunks: &mut I) -> Option<&'a [T]>
+where
+    T: 'a,
+    I: Iterator<Item = &'a [T]>,
+{
+    loop {
+        match chunks.next() {
+            Some([]) => {}
+            chunk => return chunk,
+        }
+    }
+}
+
+fn eq_chunked_sequences<'a, 'b, T, U, I, J>(
+    left_len: usize,
+    right_len: usize,
+    mut left_chunks: I,
+    mut right_chunks: J,
+) -> bool
+where
+    T: PartialEq<U> + 'a,
+    U: 'b,
+    I: Iterator<Item = &'a [T]>,
+    J: Iterator<Item = &'b [U]>,
+{
+    if left_len != right_len {
+        return false;
+    }
+
+    let mut left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+    let mut right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
+    while !left.is_empty() || !right.is_empty() {
+        let count = left.len().min(right.len());
+        if count == 0 {
+            return false;
+        }
+        if left[..count] != right[..count] {
+            return false;
+        }
+
+        left = &left[count..];
+        right = &right[count..];
+        if left.is_empty() {
+            left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+        }
+        if right.is_empty() {
+            right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
+        }
+    }
+
+    true
+}
+
+fn partial_cmp_chunked_sequences<'a, 'b, T, U, I, J>(
+    mut left_chunks: I,
+    mut right_chunks: J,
+) -> Option<Ordering>
 where
     T: PartialOrd<U> + 'a,
     U: 'b,
-    I: Iterator<Item = &'a T>,
-    J: Iterator<Item = &'b U>,
+    I: Iterator<Item = &'a [T]>,
+    J: Iterator<Item = &'b [U]>,
 {
+    let mut left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+    let mut right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
     loop {
-        match (left.next(), right.next()) {
-            (Some(left_value), Some(right_value)) => match left_value.partial_cmp(right_value)? {
+        match (left.is_empty(), right.is_empty()) {
+            (true, true) => return Some(Ordering::Equal),
+            (true, false) => return Some(Ordering::Less),
+            (false, true) => return Some(Ordering::Greater),
+            (false, false) => {}
+        }
+
+        let count = left.len().min(right.len());
+        let mut offset = 0usize;
+        while offset < count {
+            match left[offset].partial_cmp(&right[offset])? {
                 Ordering::Equal => {}
                 ordering => return Some(ordering),
-            },
-            (Some(_), None) => return Some(Ordering::Greater),
-            (None, Some(_)) => return Some(Ordering::Less),
-            (None, None) => return Some(Ordering::Equal),
+            }
+            offset += 1;
+        }
+
+        left = &left[count..];
+        right = &right[count..];
+        if left.is_empty() {
+            left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+        }
+        if right.is_empty() {
+            right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
+        }
+    }
+}
+
+fn cmp_chunked_sequences<'a, T, I, J>(mut left_chunks: I, mut right_chunks: J) -> Ordering
+where
+    T: Ord + 'a,
+    I: Iterator<Item = &'a [T]>,
+    J: Iterator<Item = &'a [T]>,
+{
+    let mut left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+    let mut right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
+    loop {
+        match (left.is_empty(), right.is_empty()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
+        }
+
+        let count = left.len().min(right.len());
+        match left[..count].cmp(&right[..count]) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+
+        left = &left[count..];
+        right = &right[count..];
+        if left.is_empty() {
+            left = next_non_empty_chunk(&mut left_chunks).unwrap_or(&[]);
+        }
+        if right.is_empty() {
+            right = next_non_empty_chunk(&mut right_chunks).unwrap_or(&[]);
         }
     }
 }
@@ -1456,7 +1855,7 @@ where
     T: PartialEq<U>,
 {
     fn eq(&self, other: &ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>) -> bool {
-        self.len == other.len && self.iter().eq(other.iter())
+        eq_chunked_sequences(self.len, other.len, self.chunks(), other.chunks())
     }
 }
 
@@ -1466,7 +1865,12 @@ where
     T: PartialEq<U>,
 {
     fn eq(&self, other: &[U]) -> bool {
-        self.len == other.len() && self.iter().eq(other.iter())
+        eq_chunked_sequences(
+            self.len,
+            other.len(),
+            self.chunks(),
+            core::iter::once(other),
+        )
     }
 }
 
@@ -1541,7 +1945,7 @@ where
         &self,
         other: &ExponentialArray<U, OTHER_BASE_SHIFT, OTHER_CHUNKS>,
     ) -> Option<Ordering> {
-        partial_cmp_sequences(self.iter(), other.iter())
+        partial_cmp_chunked_sequences(self.chunks(), other.chunks())
     }
 }
 
@@ -1551,7 +1955,7 @@ where
     T: PartialOrd<U>,
 {
     fn partial_cmp(&self, other: &[U]) -> Option<Ordering> {
-        partial_cmp_sequences(self.iter(), other.iter())
+        partial_cmp_chunked_sequences(self.chunks(), core::iter::once(other))
     }
 }
 
@@ -1609,7 +2013,7 @@ impl<T: Ord, const BASE_SHIFT: usize, const CHUNKS: usize> Ord
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
 {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.iter().cmp(other.iter())
+        cmp_chunked_sequences(self.chunks(), other.chunks())
     }
 }
 
@@ -1652,7 +2056,19 @@ where
     where
         I: IntoIterator<Item = &'a T>,
     {
-        self.extend(iter.into_iter().copied());
+        let mut iterator = iter.into_iter();
+        let (lower, _) = iterator.size_hint();
+        if lower != 0 {
+            self.reserve(lower);
+            // SAFETY: the reservation above guarantees at least `lower`
+            // uninitialized tail slots. The helper handles an iterator that
+            // yields fewer items than its lower bound defensively.
+            unsafe { self.copy_refs_to_tail_reserved(&mut iterator, lower) };
+        }
+
+        for value in iterator {
+            self.push(*value);
+        }
     }
 }
 
@@ -1684,9 +2100,16 @@ impl<T, const N: usize, const BASE_SHIFT: usize, const CHUNKS: usize> From<[T; N
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<Vec<T>>
     for ExponentialArray<T, BASE_SHIFT, CHUNKS>
 {
-    fn from(values: Vec<T>) -> Self {
-        let mut array = Self::with_capacity(values.len());
-        array.extend(values);
+    fn from(mut values: Vec<T>) -> Self {
+        let len = values.len();
+        let mut array = Self::with_capacity(len);
+        // SAFETY: `values.as_ptr()..len` is initialized, `array` has enough
+        // reserved disjoint tail storage, and `values` is marked empty after
+        // the non-panicking bulk move so moved elements are not dropped twice.
+        unsafe {
+            array.move_from_ptr_to_tail_unchecked(values.as_ptr(), len);
+            values.set_len(0);
+        }
         array
     }
 }
@@ -1694,9 +2117,24 @@ impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<Vec<T>>
 impl<T, const BASE_SHIFT: usize, const CHUNKS: usize> From<ExponentialArray<T, BASE_SHIFT, CHUNKS>>
     for Vec<T>
 {
-    fn from(array: ExponentialArray<T, BASE_SHIFT, CHUNKS>) -> Self {
-        let mut values = Vec::with_capacity(array.len());
-        values.extend(array);
+    fn from(mut array: ExponentialArray<T, BASE_SHIFT, CHUNKS>) -> Self {
+        let len = array.len();
+        let mut values = Vec::with_capacity(len);
+        // SAFETY: `array[0..len]` is initialized, `values` has enough reserved
+        // disjoint storage, and `array` is marked empty after the non-panicking
+        // bulk move so moved elements are not dropped twice.
+        unsafe {
+            ExponentialArray::<T, BASE_SHIFT, CHUNKS>::move_array_range_to_ptr_unchecked(
+                &array,
+                0,
+                len,
+                values.as_mut_ptr(),
+            );
+            values.set_len(len);
+            array.len = 0;
+            array.tail_chunk = 0;
+            array.tail_offset = 0;
+        }
         values
     }
 }

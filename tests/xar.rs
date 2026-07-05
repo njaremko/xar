@@ -1268,6 +1268,159 @@ fn slice_array_and_vec_conversions_preserve_sequence() {
 }
 
 #[test]
+fn bulk_move_helpers_drop_each_element_once() {
+    #[derive(Clone)]
+    struct DropCounter(Rc<Cell<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+
+    {
+        let mut dst = PropertyArray::new();
+        dst.push(DropCounter(drops.clone()));
+        let mut src = (0..5)
+            .map(|_| DropCounter(drops.clone()))
+            .collect::<PropertyArray<_>>();
+        dst.append(&mut src);
+        assert!(src.is_empty());
+        assert_eq!(dst.len(), 6);
+    }
+    assert_eq!(drops.get(), 6);
+
+    drops.set(0);
+    {
+        let mut xs = (0..6)
+            .map(|_| DropCounter(drops.clone()))
+            .collect::<PropertyArray<_>>();
+        let tail = xs.split_off(2);
+        assert_eq!(xs.len(), 2);
+        assert_eq!(tail.len(), 4);
+    }
+    assert_eq!(drops.get(), 6);
+
+    drops.set(0);
+    {
+        let source = (0..6)
+            .map(|_| DropCounter(drops.clone()))
+            .collect::<Vec<_>>();
+        let array = PropertyArray::from(source);
+        assert_eq!(array.len(), 6);
+    }
+    assert_eq!(drops.get(), 6);
+
+    drops.set(0);
+    {
+        let array = (0..6)
+            .map(|_| DropCounter(drops.clone()))
+            .collect::<PropertyArray<_>>();
+        let values = Vec::from(array);
+        assert_eq!(values.len(), 6);
+    }
+    assert_eq!(drops.get(), 6);
+}
+
+#[test]
+fn tail_initialization_guard_keeps_partial_appends_owned_after_panic() {
+    struct PanicCloneState {
+        clones: Cell<usize>,
+        drops: Cell<usize>,
+        panic_at_clone: usize,
+    }
+
+    struct PanicClone(Rc<PanicCloneState>);
+
+    impl Clone for PanicClone {
+        fn clone(&self) -> Self {
+            let clone = self.0.clones.get() + 1;
+            self.0.clones.set(clone);
+            if clone == self.0.panic_at_clone {
+                panic!("clone panic for test");
+            }
+            Self(self.0.clone())
+        }
+    }
+
+    impl Drop for PanicClone {
+        fn drop(&mut self) {
+            self.0.drops.set(self.0.drops.get() + 1);
+        }
+    }
+
+    fn state(panic_at_clone: usize) -> Rc<PanicCloneState> {
+        Rc::new(PanicCloneState {
+            clones: Cell::new(0),
+            drops: Cell::new(0),
+            panic_at_clone,
+        })
+    }
+
+    let extend_from_slice_state = state(3);
+    {
+        let source = (0..4)
+            .map(|_| PanicClone(extend_from_slice_state.clone()))
+            .collect::<Vec<_>>();
+        let mut xs = PropertyArray::from([PanicClone(extend_from_slice_state.clone())]);
+        let result = catch_unwind(AssertUnwindSafe(|| xs.extend_from_slice(&source)));
+        assert!(result.is_err());
+        assert_eq!(xs.len(), 3);
+    }
+    assert_eq!(extend_from_slice_state.clones.get(), 3);
+    assert_eq!(extend_from_slice_state.drops.get(), 7);
+
+    let extend_from_within_state = state(3);
+    {
+        let mut xs = (0..4)
+            .map(|_| PanicClone(extend_from_within_state.clone()))
+            .collect::<PropertyArray<_>>();
+        let result = catch_unwind(AssertUnwindSafe(|| xs.extend_from_within(0..4)));
+        assert!(result.is_err());
+        assert_eq!(xs.len(), 6);
+    }
+    assert_eq!(extend_from_within_state.clones.get(), 3);
+    assert_eq!(extend_from_within_state.drops.get(), 6);
+
+    let resize_state = state(3);
+    {
+        let mut xs = (0..2)
+            .map(|_| PanicClone(resize_state.clone()))
+            .collect::<PropertyArray<_>>();
+        let fill = PanicClone(resize_state.clone());
+        let result = catch_unwind(AssertUnwindSafe(|| xs.resize(6, fill)));
+        assert!(result.is_err());
+        assert_eq!(xs.len(), 4);
+    }
+    assert_eq!(resize_state.clones.get(), 3);
+    assert_eq!(resize_state.drops.get(), 5);
+
+    let resize_with_state = state(usize::MAX);
+    {
+        let mut xs = (0..2)
+            .map(|_| PanicClone(resize_with_state.clone()))
+            .collect::<PropertyArray<_>>();
+        let calls = Cell::new(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            xs.resize_with(6, || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                if call == 3 {
+                    panic!("generator panic for test");
+                }
+                PanicClone(resize_with_state.clone())
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 3);
+        assert_eq!(xs.len(), 4);
+    }
+    assert_eq!(resize_with_state.drops.get(), 4);
+}
+
+#[test]
 fn comparison_and_extend_traits_accept_common_sequence_inputs() {
     let mut xs = PropertyArray::<i32>::new();
     xs.extend(&[1, 2, 3]);
