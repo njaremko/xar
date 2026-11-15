@@ -189,10 +189,29 @@ impl XarVecMachine {
     fn matches_vec(&mut self, _: hegel::TestCase) {
         assert_i32_array_matches_vec(&self.array, &self.model);
     }
+
+    #[cfg(feature = "serde")]
+    #[invariant]
+    fn matches_serialized_via_json(&mut self, _: hegel::TestCase) {
+        let serialized = serde_json::to_string(&self.array).expect("Should serialize");
+        let deserialized: PropertyArray<i32> = serde_json::from_str(&serialized).expect("Should deserialize");
+        assert_eq!(&self.array, &deserialized);
+    }
+
+    #[cfg(feature = "serde")]
+    #[invariant]
+    fn matches_serialized_via_toml(&mut self, _: hegel::TestCase) {
+        let mut map = std::collections::HashMap::new();
+        map.insert("values", &self.array); // Note: TOML does not have a raw value serialization, so we wrap and unwrap maps here.
+        let serialized = toml::to_string(&map).expect("Should serialize");
+        let map_of_deserialized: std::collections::HashMap<String, PropertyArray<i32>> = toml::from_str(&serialized).expect("Should deserialize");
+        let deserialized: &PropertyArray<i32> = map_of_deserialized.get("values").expect("Should deserialize");
+        assert_eq!(&self.array, deserialized);
+    }
 }
 
 #[hegel::test(test_cases = 64)]
-fn generated_operations_match_vec_model(tc: hegel::TestCase) {
+fn generated_operations_match_models(tc: hegel::TestCase) {
     let machine = XarVecMachine {
         array: PropertyArray::new(),
         model: Vec::new(),

@@ -18,10 +18,16 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 std = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0.229", optional = true }
 
 [dev-dependencies]
 divan = "0.1.21"
 hegeltest = "0.23.2"
+serde_json = "1.0.154"
+toml = "1.2.1"
 
 [[bench]]
 name = "xar_vs_vec"

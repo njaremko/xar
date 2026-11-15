@@ -148,6 +148,80 @@ pub struct ExponentialArray<T, const BASE_SHIFT: usize, const CHUNKS: usize> {
     chunks: [Option<NonNull<MaybeUninit<T>>>; CHUNKS],
 }
 
+#[cfg(feature = "serde")]
+impl<T: Send + serde::Serialize, const BASE_SHIFT: usize, const CHUNKS: usize> serde::Serialize
+    for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+{
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<<S as serde::Serializer>::Ok, <S as serde::Serializer>::Error> {
+        use serde::ser::SerializeSeq;
+        let size_hint = if self.len > 0 {
+            Some(self.capacity())
+        } else {
+            None
+        };
+        let mut seq = serializer.serialize_seq(size_hint)?;
+        for val in self.iter() {
+            seq.serialize_element(val)?;
+        }
+        seq.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'a, T: Send + serde::Deserialize<'a>, const BASE_SHIFT: usize, const CHUNKS: usize>
+    serde::Deserialize<'a> for ExponentialArray<T, BASE_SHIFT, CHUNKS>
+{
+    fn deserialize<D: serde::Deserializer<'a>>(
+        deserializer: D,
+    ) -> Result<Self, <D as serde::Deserializer<'a>>::Error> {
+        struct ExponentialArrayVisitor<'b, T2: Send, const BASE_SHIFT2: usize, const CHUNKS2: usize>
+        where
+            T2: serde::Deserialize<'b>,
+        {
+            value: ExponentialArray<T2, { BASE_SHIFT2 }, { CHUNKS2 }>,
+            lifetime: PhantomData<&'b ()>,
+        }
+
+        impl<'de, T2: Send, const BASE_SHIFT2: usize, const CHUNKS2: usize> serde::de::Visitor<'de>
+            for ExponentialArrayVisitor<'de, T2, { BASE_SHIFT2 }, { CHUNKS2 }>
+        where
+            T2: serde::Deserialize<'de>,
+        {
+            type Value = ExponentialArray<T2, { BASE_SHIFT2 }, { CHUNKS2 }>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("ExponentialArray")
+            }
+
+            fn visit_seq<A>(mut self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Decrease the number of reallocations if there are many elements
+                if let Some(capacity) = seq.size_hint() {
+                    self.value = ExponentialArray::with_capacity(capacity);
+                }
+
+                // Visit each element in the inner array and push it onto
+                // the existing vector.
+                while let Some(elem) = seq.next_element()? {
+                    self.value.push(elem);
+                }
+                Ok(self.value)
+            }
+        }
+
+        deserializer.deserialize_seq(ExponentialArrayVisitor {
+            value: ExponentialArray::new(),
+            lifetime: PhantomData,
+        }
+            as ExponentialArrayVisitor<'a, T, { BASE_SHIFT }, { CHUNKS }>)
+    }
+}
+
 // SAFETY: the array owns its element storage. Sending ownership to another
 // thread is sound when owned elements can be sent.
 unsafe impl<T: Send, const BASE_SHIFT: usize, const CHUNKS: usize> Send
